@@ -732,13 +732,27 @@ function Get-ChromiumLoginBlobs {
         }
     }
 
+    # --- CLOSING LOGIC ---
     if ($StatementPointer -ne [IntPtr]::Zero) {
         [void]$Sqlite3Finalize.Invoke($StatementPointer)
         $StatementPointer = [IntPtr]::Zero
     }
+
     if ($DatabasePointer -ne [IntPtr]::Zero) {
         [void]$Sqlite3Close.Invoke($DatabasePointer)
         $DatabasePointer = [IntPtr]::Zero
+    }
+
+    # CRITICAL: This forces PowerShell to drop the file handle
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    
+    # Give the hardware a tiny millisecond to catch up
+    Start-Sleep -Milliseconds 500 
+
+    # Now the delete will work
+    if (Test-Path $TempDatabasePath) {
+        Remove-Item -Path $TempDatabasePath -Force -ErrorAction SilentlyContinue
     }
 
     # Give the OS/GC a moment to release any lingering handles
