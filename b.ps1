@@ -759,14 +759,16 @@ function Get-ChromiumLoginBlobs {
             Remove-Item -Path $TempDatabasePath -Force -ErrorAction Stop
         }
         catch {
-            # If it still fails, we ignore it so the script doesn't show red text
-            # The file is in %TEMP% and will be cleaned by Windows eventually
-            Log "Note: Temp DB remains in use; will be cleaned on next run."
+            # This prevents the red error text from appearing in your demo
+            Write-Host "[!] Note: Temporary database file is still being released by the system." -ForegroundColor Gray
         }
     }
     
     return $LoginResults
+} # <--- THIS BRACE CLOSES THE FUNCTION. DO NOT REMOVE IT.
 
+# The script should then continue to the next part, like:
+# function Invoke-PowerChrome { ...
 
 # ======================================================================
 # Invoke-PowerChrome (Main Function)
