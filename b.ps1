@@ -692,7 +692,7 @@ function Decrypt-ChromeKeyBlob {
             Browser                 = $Browser
             URL                     = $Url
             Username                = $Username
-            BlobHeader              = $BlobHeaderType
+            BlobHeader              = $BlobType
             Base64EncryptedPassword = [Convert]::ToBase64String($RawData)
         }
     }
